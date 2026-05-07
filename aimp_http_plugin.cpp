@@ -59,6 +59,17 @@ IAIMPPlaylistProperties* GetPlaylistProps(IAIMPPlaylist* pl) {
     return props;
 }
 
+static int GetPlaylistID(IAIMPPlaylist* pl) {
+    if (!pl) return -1;
+    IAIMPPlaylistProperties* props = GetPlaylistProps(pl);
+    if (!props) return -1;
+
+    int id = -1;
+    props->GetValueAsInt32(AIMP_PLAYLIST_PROPID_ID, &id);
+    props->Release();
+    return id;
+}
+
 // Получить имя плейлиста
 std::string GetPlaylistName(IAIMPPlaylist* pl) {
     std::string result = "Unknown";
@@ -96,20 +107,16 @@ int GetFocusedIndex(IAIMPPlaylist* pl) {
     return index;
 }
 
-// Получить индекс выделенного трека
-int GetSelectedIndex(IAIMPPlaylist* pl) {
-    // Пробегаем все треки и ищем выделенные
-    int count = pl->GetItemCount();
-    for (int i = 0; i < count; i++) {
-        IAIMPPlaylistItem* item = nullptr;
-        if (pl->GetItem(i, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
-            int selected = 0;
-            item->GetValueAsInt32(AIMP_PLAYLISTITEM_PROPID_SELECTED, &selected);
-            item->Release();
-            if (selected) return i;
-        }
-    }
-    return -1;
+static bool SetFocusedIndex(IAIMPPlaylist* pl, int index) {
+    if (!pl || index < 0) return false;
+
+    IAIMPPlaylistProperties* props = GetPlaylistProps(pl);
+    if (!props) return false;
+
+    // AIMP playlist focus cursor
+    HRESULT hr = props->SetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, index);
+    props->Release();
+    return hr == S_OK;
 }
 
 // Извлечь информацию о треке из IAIMPPlaylistItem
@@ -224,6 +231,27 @@ json GetActivePlaylistID() {
     return json{{"success", true}, {"playlist_id", activeId}};
 }
 
+// helper: текущий playlist для UI/selection
+static bool GetCurrentPlaylist(IAIMPServicePlaylistManager* mgr, IAIMPPlaylist** out) {
+    if (!mgr || !out) return false;
+    *out = nullptr;
+
+    // 1) Active
+    IAIMPPlaylist* pl = nullptr;
+    if (mgr->GetActivePlaylist(&pl) == S_OK && pl) {
+        *out = pl;
+        return true;
+    }
+
+    // 2) Playing (fallback)
+    if (mgr->GetPlayingPlaylist(&pl) == S_OK && pl) {
+        *out = pl;
+        return true;
+    }
+
+    return false;
+}
+
 // GET /api/player — полное состояние плеера
 json GetPlayerState() {
     json r;
@@ -250,21 +278,33 @@ json GetPlayerState() {
     IAIMPServicePlaylistManager* mgr = nullptr;
     if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) == S_OK && mgr) {
         IAIMPPlaylist* pl = nullptr;
-        if (mgr->GetActivePlaylist(&pl) == S_OK && pl) {
+        if (GetCurrentPlaylist(mgr, &pl) && pl) {
             int playingIdx = GetPlayingIndex(pl);
             int focusedIdx = GetFocusedIndex(pl);
             
             r["playing_index"] = playingIdx;
             r["focused_index"] = focusedIdx;
+            // new UI-selection concept (selected != playing)
+            r["selected_index"] = focusedIdx;
+            
             r["playlist_name"] = GetPlaylistName(pl);
             r["playlist_tracks"] = pl->GetItemCount();
             
-            // Информация о текущем треке
+            // Информация о текущем треке (playing)
             if (playingIdx >= 0) {
                 IAIMPPlaylistItem* item = nullptr;
                 if (pl->GetItem(playingIdx, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
                     json trackInfo = ExtractTrackInfo(item);
                     r["track"] = trackInfo;
+                    item->Release();
+                }
+            }
+            
+            // Информация о выбранном треке (selected == focus)
+            if (focusedIdx >= 0) {
+                IAIMPPlaylistItem* item = nullptr;
+                if (pl->GetItem(focusedIdx, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
+                    r["selected_track"] = ExtractTrackInfo(item);
                     item->Release();
                 }
             }
@@ -351,7 +391,7 @@ json GetFocusedTrack() {
     return r;
 }
 
-// GET /api/player/track/selected — выделенные треки (первый)
+// GET /api/player/track/selected — selected == FOCUSINDEX (UI selection, not playing)
 json GetSelectedTrack() {
     json r;
     r["success"] = false;
@@ -369,24 +409,20 @@ json GetSelectedTrack() {
         r["error"] = "No active playlist"; return r;
     }
     
-    int count = pl->GetItemCount();
-    json selectedTracks = json::array();
-    
-    for (int i = 0; i < count; i++) {
+    int focusedIdx = GetFocusedIndex(pl);
+    if (focusedIdx >= 0) {
         IAIMPPlaylistItem* item = nullptr;
-        if (pl->GetItem(i, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
-            int selected = 0;
-            item->GetValueAsInt32(AIMP_PLAYLISTITEM_PROPID_SELECTED, &selected);
-            if (selected) {
-                selectedTracks.push_back(ExtractTrackInfo(item));
-            }
+        if (pl->GetItem(focusedIdx, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
+            r["selected_index"] = focusedIdx;
+            r["track"] = ExtractTrackInfo(item);
+            r["success"] = true;
             item->Release();
+        } else {
+            r["error"] = "Cannot get focused track item";
         }
+    } else {
+        r["error"] = "No track focused";
     }
-    
-    r["count"] = selectedTracks.size();
-    r["tracks"] = selectedTracks;
-    r["success"] = true;
     
     pl->Release();
     mgr->Release();
@@ -459,7 +495,7 @@ json GetPlaylists() {
         IAIMPPlaylist* pl = nullptr;
         if (mgr->GetLoadedPlaylist(i, &pl) == S_OK && pl) {
             json p;
-            p["id"] = i;
+            p["id"] = GetPlaylistID(pl);
             p["name"] = GetPlaylistName(pl);
             p["tracks_count"] = pl->GetItemCount();
             p["active"] = (pl == activePl);
@@ -539,6 +575,8 @@ json GetPlaylistTracks(int playlistId) {
     r["name"] = GetPlaylistName(pl);
     r["playing_index"] = playingIdx;
     r["focused_index"] = focusedIdx;
+    // new UI-selection concept
+    r["selected_index"] = focusedIdx;
     
     for (int i = 0; i < count; i++) {
         IAIMPPlaylistItem* item = nullptr;
@@ -547,6 +585,7 @@ json GetPlaylistTracks(int playlistId) {
             track["id"] = i;
             track["playing"] = (i == playingIdx);
             track["focused"] = (i == focusedIdx);
+            track["selected"] = (i == focusedIdx); // selected == focus
             r["tracks"].push_back(track);
             item->Release();
         }
@@ -601,6 +640,56 @@ json PlayPlaylistTrack(int playlistId, int trackIndex) {
     
     pl->Release();
     mgr->Release();
+    return r;
+}
+
+// POST /api/player/select — смена focus трека (selected != playing)
+json SelectTrackInActivePlaylist(int trackIndex) {
+    json r;
+    r["success"] = false;
+
+    if (trackIndex < 0) {
+        r["error"] = "Invalid track index";
+        return r;
+    }
+
+    if (!g_core) {
+        r["error"] = "No core";
+        return r;
+    }
+
+    IAIMPServicePlaylistManager* mgr = nullptr;
+    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+        r["error"] = "No playlist manager";
+        return r;
+    }
+
+    IAIMPPlaylist* pl = nullptr;
+    if (mgr->GetActivePlaylist(&pl) != S_OK || !pl) {
+        mgr->Release();
+        r["error"] = "No active playlist";
+        return r;
+    }
+
+    if (trackIndex >= pl->GetItemCount()) {
+        pl->Release();
+        mgr->Release();
+        r["error"] = "Track index out of range";
+        return r;
+    }
+
+    bool ok = SetFocusedIndex(pl, trackIndex);
+    pl->Release();
+    mgr->Release();
+
+    if (!ok) {
+        r["error"] = "Cannot set focus index";
+        return r;
+    }
+
+    r["action"] = "select";
+    r["selected_index"] = trackIndex;
+    r["success"] = true;
     return r;
 }
 
@@ -951,9 +1040,29 @@ void RunHttpServer() {
                         rsp = GetPlaylists();
                     }
                     
+                    // POST /api/player/select?track=IDX
+                    else if (req.path == "/api/player/select") {
+                        int trackIndex = -1;
+                        auto it = req.params.find("track");
+                        if (it != req.params.end()) trackIndex = std::stoi(it->second);
+                        if (trackIndex < 0 && !req.body.empty()) {
+                            try {
+                                json b = json::parse(req.body);
+                                if (b.contains("track")) trackIndex = b["track"];
+                            } catch (...) {}
+                        }
+                        if (trackIndex >= 0) {
+                            rsp = SelectTrackInActivePlaylist(trackIndex);
+                        } else {
+                            rsp["error"] = "Need track parameter";
+                            code = 400;
+                        }
+                    }
+
                     // GET /api/playlist/{id}
                     // GET /api/playlist/{id}/tracks
                     // POST /api/playlist/{id}/play
+// POST /api/playlist/{id}/focus
                     else if (req.path.find("/api/playlist/") == 0) {
                         std::string path = req.path;
                         size_t s = 14; // длина "/api/playlist/"
@@ -965,7 +1074,41 @@ void RunHttpServer() {
                         catch (...) { rsp["error"] = "Invalid playlist ID"; code = 400; }
                         
                         if (playlistId >= 0) {
-                            if (path.find("/play") != std::string::npos) {
+                            if (path.find("/focus") != std::string::npos) {
+                                // POST /api/playlist/{id}/focus
+                                IAIMPServicePlaylistManager* mgr = nullptr;
+                                if (!g_core || g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+                                    rsp["error"] = "No playlist manager";
+                                    code = 500;
+                                } else {
+                                    IAIMPPlaylist* pl = nullptr;
+
+                                    // Find playlist by ID: SDK has GetLoadedPlaylistByID(IAIMPString* ID,...)
+                                    // We'll use same numeric id converted to string (Win wide strings in SDK typically need IAIMPString).
+                                    // Since we don't have helper to create IAIMPString here, we fallback to index-search by loaded playlists.
+                                    int count = mgr->GetLoadedPlaylistCount();
+                                    bool found = false;
+                                    for (int i = 0; i < count; i++) {
+                                        IAIMPPlaylist* tmp = nullptr;
+                                        if (mgr->GetLoadedPlaylist(i, &tmp) == S_OK && tmp) {
+                                            if (GetPlaylistID(tmp) == playlistId) { pl = tmp; found = true; break; }
+                                            tmp->Release();
+                                        }
+                                    }
+
+                                    if (!found || !pl) {
+                                        rsp["error"] = "Playlist not found";
+                                        code = 404;
+                                    } else {
+                                        HRESULT hr = mgr->SetActivePlaylist(pl);
+                                        rsp["action"] = "focus_playlist";
+                                        rsp["playlist_id"] = playlistId;
+                                        rsp["success"] = (hr == S_OK);
+                                        pl->Release();
+                                    }
+                                    mgr->Release();
+                                }
+                            } else if (path.find("/play") != std::string::npos) {
                                 // POST /api/playlist/{id}/play
                                 int trackIndex = -1;
                                 auto it = req.params.find("track");
@@ -1013,9 +1156,10 @@ void RunHttpServer() {
                             {{"method", "GET"},    {"path", "/api/status"},                  {"desc", "Full player status"}},
                             {{"method", "GET"},    {"path", "/api/player"},                  {"desc", "Player state"}},
                             {{"method", "GET"},    {"path", "/api/player/state"},            {"desc", "Playback state only"}},
-                            {{"method", "GET"},    {"path", "/api/player/track"},            {"desc", "Current track info"}},
-                            {{"method", "GET"},    {"path", "/api/player/track/focused"},    {"desc", "Focused track info"}},
-                            {{"method", "GET"},    {"path", "/api/player/track/selected"},   {"desc", "Selected tracks"}},
+                            {{"method", "GET"},    {"path", "/api/player/track"},            {"desc", "Playing track info"}},
+                            {{"method", "GET"},    {"path", "/api/player/track/focused"},    {"desc", "Focused track info (FOCUSINDEX)"}},
+                            {{"method", "GET"},    {"path", "/api/player/track/selected"},   {"desc", "Selected track info (selected == focus)"}},
+                            {{"method", "POST"},   {"path", "/api/player/select?track=IDX"}, {"desc", "Select track by focus cursor without playing"}},
                             {{"method", "GET"},    {"path", "/api/player/position"},         {"desc", "Get position"}},
                             {{"method", "POST"},   {"path", "/api/player/position"},         {"desc", "Set position"}},
                             {{"method", "GET"},    {"path", "/api/player/volume"},           {"desc", "Get volume"}},
@@ -1029,7 +1173,8 @@ void RunHttpServer() {
                             {{"method", "GET"},    {"path", "/api/playlists"},               {"desc", "List playlists"}},
                             {{"method", "GET"},    {"path", "/api/playlist/{id}"},           {"desc", "Playlist info"}},
                             {{"method", "GET"},    {"path", "/api/playlist/{id}/tracks"},    {"desc", "Tracks in playlist"}},
-                            {{"method", "POST"},   {"path", "/api/playlist/{id}/play"},      {"desc", "Play track from playlist"}}
+                            {{"method", "POST"},   {"path", "/api/playlist/{id}/play"},      {"desc", "Play track from playlist"}},
+                            {{"method", "POST"},   {"path", "/api/playlist/{id}/focus"},     {"desc", "Focus (activate) playlist for UI without playing"}}
                         });
                     }
                     
