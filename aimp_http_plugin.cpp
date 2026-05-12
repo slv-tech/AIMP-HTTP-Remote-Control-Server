@@ -256,42 +256,100 @@ json GetPlayerStatus() {
 json GetPlaylistsResponse() {
     json r;
     r["playlists"] = json::array();
+    json& dbg = r["_debug"];
 
+    // 1. Проверка g_core
+    dbg["g_core_ok"] = (g_core != nullptr);
     if (!g_core) {
         r["error"] = "core not initialized";
         return r;
     }
 
+    // 2. Получение менеджера плейлистов
     IAIMPServicePlaylistManager* mgr = nullptr;
-    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+    HRESULT hrMgr = g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr);
+    dbg["mgr_hresult"]  = (int)hrMgr;
+    dbg["mgr_ptr_ok"]   = (mgr != nullptr);
+    if (hrMgr != S_OK || !mgr) {
         r["error"] = "playlist manager unavailable";
         return r;
     }
 
-    // Активный плейлист (выбранная вкладка)
-    IAIMPPlaylist* activePl = nullptr;
-    mgr->GetActivePlaylist(&activePl);
-
-    // Воспроизводимый плейлист (тот, из которого играет трек)
-    IAIMPPlaylist* playingPl = nullptr;
-    mgr->GetPlayingPlaylist(&playingPl);
-
+    // 3. Количество плейлистов
     int count = mgr->GetLoadedPlaylistCount();
+    dbg["loaded_playlist_count"] = count;
+
+    // 4. GetActivePlaylist
+    IAIMPPlaylist* activePl = nullptr;
+    HRESULT hrActive = mgr->GetActivePlaylist(&activePl);
+    dbg["active_playlist_hresult"] = (int)hrActive;
+    dbg["active_playlist_ptr_ok"]  = (activePl != nullptr);
+
+    // 5. GetPlayingPlaylist
+    IAIMPPlaylist* playingPl = nullptr;
+    HRESULT hrPlaying = mgr->GetPlayingPlaylist(&playingPl);
+    dbg["playing_playlist_hresult"] = (int)hrPlaying;
+    dbg["playing_playlist_ptr_ok"]  = (playingPl != nullptr);
+
+    // 6. Цикл по плейлистам
+    json loopDbg = json::array();
     for (int i = 0; i < count; i++) {
         IAIMPPlaylist* pl = nullptr;
-        if (mgr->GetLoadedPlaylist(i, &pl) != S_OK || !pl)
-            continue;
+        HRESULT hrGet = mgr->GetLoadedPlaylist(i, &pl);
 
+        json entry;
+        entry["index"]        = i;
+        entry["get_hresult"]  = (int)hrGet;
+        entry["pl_ptr_ok"]    = (pl != nullptr);
+
+        if (hrGet != S_OK || !pl) {
+            loopDbg.push_back(entry);
+            continue;
+        }
+
+        entry["get_item_count"] = pl->GetItemCount();
+
+        // Проверяем QueryInterface на IAIMPPropertyList
+        IAIMPPropertyList* propList = nullptr;
+        HRESULT hrQI = pl->QueryInterface(IID_IAIMPPropertyList, (void**)&propList);
+        entry["qi_proplist_hresult"] = (int)hrQI;
+        entry["qi_proplist_ok"]      = (propList != nullptr);
+        if (propList) {
+            // Читаем имя напрямую
+            IAIMPString* nameStr = nullptr;
+            HRESULT hrName = propList->GetValueAsObject(AIMP_PLAYLIST_PROPID_NAME, IID_IAIMPString, (void**)&nameStr);
+            entry["name_hresult"] = (int)hrName;
+            if (nameStr) {
+                entry["name"] = WStr(nameStr->GetData());
+                nameStr->Release();
+            } else {
+                entry["name"] = nullptr;
+            }
+            // Читаем ID
+            IAIMPString* idStr = nullptr;
+            HRESULT hrId = propList->GetValueAsObject(AIMP_PLAYLIST_PROPID_ID, IID_IAIMPString, (void**)&idStr);
+            entry["id_hresult"] = (int)hrId;
+            if (idStr) {
+                entry["aimp_id"] = WStr(idStr->GetData());
+                idStr->Release();
+            } else {
+                entry["aimp_id"] = nullptr;
+            }
+            propList->Release();
+        }
+
+        loopDbg.push_back(entry);
+
+        // Основной ответ
         json p;
-        p["id"]          = i;                    // числовой индекс для маршрутизации (/api/playlists/0/tracks и т.д.)
-        p["aimp_id"]     = GetPlaylistId(pl);    // реальный строковый ID из AIMP (AIMP_PLAYLIST_PROPID_ID)
+        p["id"]          = i;
+        p["aimp_id"]     = GetPlaylistId(pl);
         p["name"]        = GetPlaylistName(pl);
         p["track_count"] = pl->GetItemCount();
         p["duration"]    = GetPlaylistDuration(pl);
 
         bool isActive  = (activePl  && activePl  == pl);
         bool isPlaying = (playingPl && playingPl == pl);
-
         if (isPlaying) {
             int playingIdx = GetPlayingIndex(pl);
             p["state"] = (playingIdx >= 0) ? "playing" : "active";
@@ -304,6 +362,7 @@ json GetPlaylistsResponse() {
         r["playlists"].push_back(p);
         pl->Release();
     }
+    dbg["loop"] = loopDbg;
 
     if (activePl)  activePl->Release();
     if (playingPl) playingPl->Release();
