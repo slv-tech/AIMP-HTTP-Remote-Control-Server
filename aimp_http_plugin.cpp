@@ -34,6 +34,13 @@ int        g_port    = 3553;
 bool       g_running = false;
 std::thread g_serverThread;
 
+// Фокус навигации (для Bitfocus: < плейлист >, < трек >)
+// Хранит индекс плейлиста и трека которые пользователь выбрал кнопками.
+// Не зависит от того, что сейчас играет.
+std::mutex g_focusMutex;
+int g_focusPlaylistIdx = 0;  // индекс плейлиста в фокусе
+int g_focusTrackIdx    = 0;  // индекс трека в фокусе (в рамках g_focusPlaylistIdx)
+
 // ==========================================
 // Утилиты
 // ==========================================
@@ -184,7 +191,38 @@ void GetFileInfo(IAIMPPlaylistItem* item, json& out) {
 // API-функции
 // ==========================================
 
-// Player status — IAIMPServicePlayer thread-safe, вызывается из HTTP-потока напрямую
+// Вспомогательная: заполнить json информацией о плейлисте по индексу (вызывать из главного потока)
+// Возвращает false если плейлист не найден
+bool FillPlaylistJson(IAIMPServicePlaylistManager* mgr, int idx, json& out) {
+    if (idx < 0) return false;
+    IAIMPPlaylist* pl = nullptr;
+    if (mgr->GetLoadedPlaylist(idx, &pl) != S_OK || !pl) return false;
+    out["id"]          = idx;
+    out["aimp_id"]     = GetPlaylistId(pl);
+    out["name"]        = GetPlaylistName(pl);
+    out["track_count"] = pl->GetItemCount();
+    pl->Release();
+    return true;
+}
+
+// Вспомогательная: заполнить json информацией о треке (вызывать из главного потока)
+bool FillTrackJson(IAIMPServicePlaylistManager* mgr, int plIdx, int trackIdx, json& out) {
+    if (plIdx < 0 || trackIdx < 0) return false;
+    IAIMPPlaylist* pl = nullptr;
+    if (mgr->GetLoadedPlaylist(plIdx, &pl) != S_OK || !pl) return false;
+    if (trackIdx >= pl->GetItemCount()) { pl->Release(); return false; }
+    IAIMPPlaylistItem* item = nullptr;
+    if (pl->GetItem(trackIdx, IID_IAIMPPlaylistItem, (void**)&item) != S_OK || !item) {
+        pl->Release(); return false;
+    }
+    out["id"]    = trackIdx;
+    out["playlist_id"] = plIdx;
+    GetFileInfo(item, out);
+    item->Release();
+    pl->Release();
+    return true;
+}
+
 json GetPlayerStatus() {
     json r;
     r["state"]    = "stopped";
@@ -194,38 +232,198 @@ json GetPlayerStatus() {
     r["duration"] = 0.0;
     if (!g_core) return r;
 
+    // --- Часть 1: IAIMPServicePlayer (thread-safe, вызываем напрямую) ---
     IAIMPServicePlayer* player = nullptr;
-    if (g_core->QueryInterface(IID_IAIMPServicePlayer, (void**)&player) != S_OK || !player)
-        return r;
-
-    int st = player->GetState();
-    r["state"] = (st == AIMP_PLAYER_STATE_PLAYING) ? "playing"
-               : (st == AIMP_PLAYER_STATE_PAUSED)  ? "paused" : "stopped";
-
-    double pos = 0; player->GetPosition(&pos); r["position"] = pos;
-    double dur = 0; player->GetDuration(&dur);  r["duration"] = dur;
-    float  vol = 0; player->GetVolume(&vol);    r["volume"]   = (int)(vol * 100.0f);
-    BOOL muted = FALSE; player->GetMute(&muted); r["muted"] = (muted != FALSE);
-
-    // Текущий трек — тоже через player, который thread-safe
-    IAIMPPlaylistItem* pi = nullptr;
-    if (player->GetPlaylistItem(&pi) == S_OK && pi) {
-        json ti;
-        // filename можно читать из HTTP-потока — это просто строка
-        IAIMPString* fn = nullptr;
-        if (pi->GetValueAsObject(AIMP_PLAYLISTITEM_PROPID_FILENAME, IID_IAIMPString, (void**)&fn) == S_OK && fn) {
-            r["filenameplaying"] = WStr(fn->GetData()); fn->Release();
-        }
-        // FileInfo тоже читаем здесь — player->GetPlaylistItem вернул нам объект
-        // в главном потоке (AIMP сам вызывает нас из главного потока для player API)
-        GetFileInfo(pi, ti);
-        if (ti.contains("title"))  r["track_title"]  = ti["title"];
-        if (ti.contains("artist")) r["track_artist"]  = ti["artist"];
-        if (ti.contains("album"))  r["track_album"]   = ti["album"];
-        if (ti.contains("duration")) r["duration"]    = ti["duration"];
-        pi->Release();
+    if (g_core->QueryInterface(IID_IAIMPServicePlayer, (void**)&player) == S_OK && player) {
+        int st = player->GetState();
+        r["state"] = (st == AIMP_PLAYER_STATE_PLAYING) ? "playing"
+                   : (st == AIMP_PLAYER_STATE_PAUSED)  ? "paused" : "stopped";
+        double pos = 0; player->GetPosition(&pos); r["position"] = pos;
+        double dur = 0; player->GetDuration(&dur);  r["duration"] = dur;
+        float  vol = 0; player->GetVolume(&vol);    r["volume"]   = (int)(vol * 100.0f);
+        BOOL muted = FALSE; player->GetMute(&muted); r["muted"] = (muted != FALSE);
+        player->Release();
     }
-    player->Release();
+
+    // --- Часть 2: Данные плейлистов/треков — требуют главного потока ---
+    // playing_playlist, playing_track, focus_playlist, focus_track
+    int focusPlIdx, focusTrIdx;
+    {
+        std::lock_guard<std::mutex> lk(g_focusMutex);
+        focusPlIdx = g_focusPlaylistIdx;
+        focusTrIdx = g_focusTrackIdx;
+    }
+
+    RunInMainThread([&]() {
+        IAIMPServicePlaylistManager* mgr = nullptr;
+        if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr)
+            return;
+
+        int totalPlaylists = mgr->GetLoadedPlaylistCount();
+        r["playlist_count"] = totalPlaylists;
+
+        // --- playing_playlist: тот, из которого играет трек ---
+        IAIMPPlaylist* playingPl = nullptr;
+        if (mgr->GetPlayingPlaylist(&playingPl) == S_OK && playingPl) {
+            // Найдём его индекс
+            for (int i = 0; i < totalPlaylists; i++) {
+                IAIMPPlaylist* tmp = nullptr;
+                if (mgr->GetLoadedPlaylist(i, &tmp) == S_OK && tmp) {
+                    bool match = (tmp == playingPl);
+                    tmp->Release();
+                    if (match) {
+                        json pp;
+                        FillPlaylistJson(mgr, i, pp);
+                        r["playing_playlist"] = pp;
+
+                        // --- playing_track: трек который сейчас играет ---
+                        int playingIdx = GetPlayingIndex(playingPl);
+                        if (playingIdx >= 0) {
+                            json pt;
+                            FillTrackJson(mgr, i, playingIdx, pt);
+                            r["playing_track"] = pt;
+                        } else {
+                            r["playing_track"] = nullptr;
+                        }
+                        break;
+                    }
+                }
+            }
+            playingPl->Release();
+        } else {
+            r["playing_playlist"] = nullptr;
+            r["playing_track"]    = nullptr;
+        }
+
+        // --- focus_playlist: плейлист в фокусе (наш g_focusPlaylistIdx) ---
+        // Зажимаем индекс в допустимых границах
+        if (totalPlaylists > 0) {
+            if (focusPlIdx >= totalPlaylists) focusPlIdx = totalPlaylists - 1;
+            {
+                std::lock_guard<std::mutex> lk(g_focusMutex);
+                g_focusPlaylistIdx = focusPlIdx;
+            }
+            json fp;
+            if (FillPlaylistJson(mgr, focusPlIdx, fp)) {
+                r["focus_playlist"] = fp;
+            } else {
+                r["focus_playlist"] = nullptr;
+            }
+
+            // --- focus_track: трек в фокусе ---
+            IAIMPPlaylist* focusPl = nullptr;
+            if (mgr->GetLoadedPlaylist(focusPlIdx, &focusPl) == S_OK && focusPl) {
+                int trackCount = focusPl->GetItemCount();
+                if (focusTrIdx >= trackCount) focusTrIdx = std::max(0, trackCount - 1);
+                {
+                    std::lock_guard<std::mutex> lk(g_focusMutex);
+                    g_focusTrackIdx = focusTrIdx;
+                }
+                json ft;
+                if (trackCount > 0 && FillTrackJson(mgr, focusPlIdx, focusTrIdx, ft)) {
+                    r["focus_track"] = ft;
+                } else {
+                    r["focus_track"] = nullptr;
+                }
+                focusPl->Release();
+            } else {
+                r["focus_track"] = nullptr;
+            }
+        } else {
+            r["focus_playlist"] = nullptr;
+            r["focus_track"]    = nullptr;
+        }
+
+        mgr->Release();
+    });
+
+    return r;
+}
+
+// --- Focus API: навигация кнопками < > ---
+
+// Вспомогательная: сдвинуть фокус плейлиста и сбросить трек на 0
+json FocusPlaylistShift(int delta) {
+    json r;
+    if (!g_core) { r["error"] = "core not initialized"; return r; }
+
+    RunInMainThread([&]() {
+        IAIMPServicePlaylistManager* mgr = nullptr;
+        if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+            r["error"] = "playlist manager unavailable"; return;
+        }
+        int total = mgr->GetLoadedPlaylistCount();
+        if (total == 0) { mgr->Release(); r["error"] = "no playlists"; return; }
+
+        int newIdx;
+        {
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            newIdx = ((g_focusPlaylistIdx + delta) % total + total) % total;
+            g_focusPlaylistIdx = newIdx;
+            g_focusTrackIdx    = 0;  // при смене плейлиста — трек сбрасываем на первый
+        }
+
+        json fp;
+        FillPlaylistJson(mgr, newIdx, fp);
+        r["focus_playlist"] = fp;
+
+        // Возвращаем и первый трек нового плейлиста
+        json ft;
+        if (FillTrackJson(mgr, newIdx, 0, ft))
+            r["focus_track"] = ft;
+        else
+            r["focus_track"] = nullptr;
+
+        mgr->Release();
+    });
+    return r;
+}
+
+// Вспомогательная: сдвинуть фокус трека внутри текущего плейлиста
+json FocusTrackShift(int delta) {
+    json r;
+    if (!g_core) { r["error"] = "core not initialized"; return r; }
+
+    RunInMainThread([&]() {
+        IAIMPServicePlaylistManager* mgr = nullptr;
+        if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+            r["error"] = "playlist manager unavailable"; return;
+        }
+
+        int plIdx;
+        {
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            plIdx = g_focusPlaylistIdx;
+        }
+
+        IAIMPPlaylist* pl = nullptr;
+        if (mgr->GetLoadedPlaylist(plIdx, &pl) != S_OK || !pl) {
+            mgr->Release(); r["error"] = "playlist not found"; return;
+        }
+
+        int total = pl->GetItemCount();
+        pl->Release();
+
+        if (total == 0) { mgr->Release(); r["error"] = "playlist is empty"; return; }
+
+        int newTrackIdx;
+        {
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            newTrackIdx = ((g_focusTrackIdx + delta) % total + total) % total;
+            g_focusTrackIdx = newTrackIdx;
+        }
+
+        json ft;
+        FillTrackJson(mgr, plIdx, newTrackIdx, ft);
+        r["focus_track"] = ft;
+
+        // Возвращаем и текущий плейлист для контекста
+        json fp;
+        FillPlaylistJson(mgr, plIdx, fp);
+        r["focus_playlist"] = fp;
+
+        mgr->Release();
+    });
     return r;
 }
 
@@ -629,6 +827,56 @@ void RunHttpServer() {
                     if (g_core && g_core->QueryInterface(IID_IAIMPServicePlayer,(void**)&p)==S_OK && p) { p->SetPosition(pos); rsp["position"]=pos; p->Release(); }
                 } else { rsp["error"]["code"]="INVALID_POSITION"; code=400; }
             }
+            // ---- Focus API ----
+            // POST /api/focus/playlist/next  — следующий плейлист в фокусе
+            else if (req.path == "/api/focus/playlist/next" && req.method == "POST") {
+                rsp = FocusPlaylistShift(+1);
+            }
+            // POST /api/focus/playlist/prev  — предыдущий плейлист в фокусе
+            else if (req.path == "/api/focus/playlist/prev" && req.method == "POST") {
+                rsp = FocusPlaylistShift(-1);
+            }
+            // POST /api/focus/track/next  — следующий трек в фокусе
+            else if (req.path == "/api/focus/track/next" && req.method == "POST") {
+                rsp = FocusTrackShift(+1);
+            }
+            // POST /api/focus/track/prev  — предыдущий трек в фокусе
+            else if (req.path == "/api/focus/track/prev" && req.method == "POST") {
+                rsp = FocusTrackShift(-1);
+            }
+            // POST /api/focus/play  — воспроизвести трек в фокусе
+            else if (req.path == "/api/focus/play" && req.method == "POST") {
+                int plIdx, trIdx;
+                {
+                    std::lock_guard<std::mutex> lk(g_focusMutex);
+                    plIdx = g_focusPlaylistIdx;
+                    trIdx = g_focusTrackIdx;
+                }
+                ParsedPath pp;
+                pp.playlistId = plIdx;
+                pp.trackId    = trIdx;
+                pp.action     = "play";
+                DoPlaylistAction(pp, "POST", "", rsp, code);
+            }
+            // GET /api/focus  — текущее состояние фокуса без полного статуса
+            else if (req.path == "/api/focus" && req.method == "GET") {
+                int plIdx, trIdx;
+                {
+                    std::lock_guard<std::mutex> lk(g_focusMutex);
+                    plIdx = g_focusPlaylistIdx;
+                    trIdx = g_focusTrackIdx;
+                }
+                RunInMainThread([&]() {
+                    IAIMPServicePlaylistManager* mgr = nullptr;
+                    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr) {
+                        rsp["error"] = "playlist manager unavailable"; return;
+                    }
+                    json fp; FillPlaylistJson(mgr, plIdx, fp); rsp["focus_playlist"] = fp;
+                    json ft; FillTrackJson(mgr, plIdx, trIdx, ft); rsp["focus_track"] = ft;
+                    mgr->Release();
+                });
+            }
+            // ---- Playlists API ----
             else if (req.path == "/api/playlists" && req.method == "GET") {
                 rsp = GetPlaylistsResponse();
             }
@@ -657,15 +905,30 @@ void RunHttpServer() {
             else if (req.path == "/api" || req.path == "/api/") {
                 rsp["name"] = "AIMP HTTP Control API v2.0";
                 rsp["endpoints"] = json::array({
-                    "GET  /api/player/status", "POST /api/player/play", "POST /api/player/pause",
-                    "POST /api/player/stop",   "POST /api/player/next", "POST /api/player/prev",
-                    "GET  /api/player/volume", "PUT  /api/player/volume", "POST /api/player/mute",
+                    "GET  /api/player/status  — статус плеера + playing/focus плейлист и трек",
+                    "POST /api/player/play",
+                    "POST /api/player/pause",
+                    "POST /api/player/stop",
+                    "POST /api/player/next",
+                    "POST /api/player/prev",
+                    "GET  /api/player/volume",
+                    "PUT  /api/player/volume",
+                    "POST /api/player/mute",
                     "PUT  /api/player/position",
+                    "--- Focus (Bitfocus navigation) ---",
+                    "GET  /api/focus              — текущий плейлист и трек в фокусе",
+                    "POST /api/focus/playlist/next — следующий плейлист в фокусе",
+                    "POST /api/focus/playlist/prev — предыдущий плейлист в фокусе",
+                    "POST /api/focus/track/next    — следующий трек в фокусе",
+                    "POST /api/focus/track/prev    — предыдущий трек в фокусе",
+                    "POST /api/focus/play          — воспроизвести трек в фокусе",
+                    "--- Playlists ---",
                     "GET  /api/playlists",
                     "GET  /api/playlists/:id",
                     "GET  /api/playlists/:id/tracks",
                     "GET  /api/playlists/:id/tracks/:tid",
-                    "POST /api/playlists/:id/play",   "POST /api/playlists/:id/select",
+                    "POST /api/playlists/:id/play",
+                    "POST /api/playlists/:id/select",
                     "POST /api/playlists/:id/tracks/:tid/play",
                     "POST /api/playlists/:id/tracks/:tid/select"
                 });
