@@ -49,84 +49,71 @@ std::string WStr(const wchar_t* w) {
 // Вспомогательные функции AIMP API
 // ==========================================
 
-// Согласно SDK: "Property IDs for IAIMPPropertyList from IAIMPPlaylist"
-// Свойства плейлиста читаются через IID_IAIMPPropertyList, а НЕ через IID_IAIMPPlaylistProperties
-IAIMPPropertyList* GetPlaylistProps(IAIMPPlaylist* pl) {
-    if (!pl) return nullptr;
-    IAIMPPropertyList* props = nullptr;
-    pl->QueryInterface(IID_IAIMPPropertyList, (void**)&props);
-    return props;
-}
+// Согласно официальному демо SDK (TestPreimageAPIUnit.pas, строка 347):
+//   PropListGetStr(Playlist as IAIMPPropertyList, AIMP_PLAYLIST_PROPID_ID)
+// В Delphi "as" для COM-интерфейсов = QueryInterface.
+// QueryInterface возвращает новый указатель с AddRef — его нужно Release'ить.
+// Оборачиваем в helper чтобы не забывать про Release.
+struct PlaylistProps {
+    IAIMPPropertyList* ptr = nullptr;
+    explicit PlaylistProps(IAIMPPlaylist* pl) {
+        if (pl) pl->QueryInterface(IID_IAIMPPropertyList, (void**)&ptr);
+    }
+    ~PlaylistProps() { if (ptr) ptr->Release(); }
+    operator bool() const { return ptr != nullptr; }
+    IAIMPPropertyList* operator->() const { return ptr; }
+};
 
 std::string GetPlaylistName(IAIMPPlaylist* pl) {
     std::string result = "Unknown";
-    IAIMPPropertyList* props = GetPlaylistProps(pl);
+    PlaylistProps props(pl);
     if (props) {
         IAIMPString* name = nullptr;
         if (props->GetValueAsObject(AIMP_PLAYLIST_PROPID_NAME, IID_IAIMPString, (void**)&name) == S_OK && name) {
             result = WStr(name->GetData());
             name->Release();
         }
-        props->Release();
     }
     return result;
 }
 
 std::string GetPlaylistId(IAIMPPlaylist* pl) {
     std::string result = "";
-    IAIMPPropertyList* props = GetPlaylistProps(pl);
+    PlaylistProps props(pl);
     if (props) {
         IAIMPString* idStr = nullptr;
         if (props->GetValueAsObject(AIMP_PLAYLIST_PROPID_ID, IID_IAIMPString, (void**)&idStr) == S_OK && idStr) {
             result = WStr(idStr->GetData());
             idStr->Release();
         }
-        props->Release();
     }
     return result;
 }
 
-// AIMP_PLAYLIST_PROPID_PLAYINGINDEX = 52 — индекс воспроизводимого трека в плейлисте
+// AIMP_PLAYLIST_PROPID_PLAYINGINDEX = 52
 int GetPlayingIndex(IAIMPPlaylist* pl) {
     int index = -1;
-    IAIMPPropertyList* props = GetPlaylistProps(pl);
-    if (props) {
-        props->GetValueAsInt32(AIMP_PLAYLIST_PROPID_PLAYINGINDEX, &index);
-        props->Release();
-    }
+    PlaylistProps props(pl);
+    if (props) props->GetValueAsInt32(AIMP_PLAYLIST_PROPID_PLAYINGINDEX, &index);
     return index;
 }
 
 // AIMP_PLAYLIST_PROPID_FOCUSINDEX = 50
 int GetFocusedIndex(IAIMPPlaylist* pl) {
     int index = -1;
-    IAIMPPropertyList* props = GetPlaylistProps(pl);
-    if (props) {
-        props->GetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, &index);
-        props->Release();
-    }
+    PlaylistProps props(pl);
+    if (props) props->GetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, &index);
     return index;
 }
 
 // AIMP_PLAYLIST_PROPID_DURATION = 54
 double GetPlaylistDuration(IAIMPPlaylist* pl) {
     double duration = 0;
-    IAIMPPropertyList* props = GetPlaylistProps(pl);
-    if (props) {
-        props->GetValueAsFloat(AIMP_PLAYLIST_PROPID_DURATION, &duration);
-        props->Release();
-    }
+    PlaylistProps props(pl);
+    if (props) props->GetValueAsFloat(AIMP_PLAYLIST_PROPID_DURATION, &duration);
     return duration;
 }
 
-// Получить менеджер плейлистов
-IAIMPServicePlaylistManager* GetPlaylistManager() {
-    if (!g_core) return nullptr;
-    IAIMPServicePlaylistManager* mgr = nullptr;
-    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK)
-        return nullptr;
-    return mgr;
-}
 
 // Получить IAIMPFileInfo из IAIMPPlaylistItem через GetValueAsObject(PROPID_FILEINFO)
 // Согласно SDK, AIMP_PLAYLISTITEM_PROPID_FILEINFO = 2, тип IAIMPFileInfo
@@ -854,11 +841,8 @@ void RunHttpServer() {
                         if (g_core && g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) == S_OK && mgr) {
                             IAIMPPlaylist* pl = nullptr;
                             if (mgr->GetLoadedPlaylist(pp.playlistId, &pl) == S_OK && pl) {
-                                IAIMPPropertyList* props = GetPlaylistProps(pl);
-                                if (props) {
-                                    props->SetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, pp.trackId);
-                                    props->Release();
-                                }
+                                PlaylistProps props(pl);
+                                if (props) props->SetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, pp.trackId);
                                 rsp["id"]    = pp.trackId;
                                 rsp["state"] = "focused";
                                 pl->Release();
