@@ -14,6 +14,7 @@
 #include <map>
 #include <algorithm>
 #include <functional>
+#include <set>
 
 #include "third_party/json.hpp"
 using json = nlohmann::json;
@@ -41,6 +42,19 @@ std::thread g_serverThread;
 std::mutex g_focusMutex;
 int g_focusPlaylistIdx = 0;  // индекс плейлиста в фокусе
 int g_focusTrackIdx    = 0;  // индекс трека в фокусе (в рамках g_focusPlaylistIdx)
+
+// Синхронизация фокуса с UI AIMP
+// Forward declarations
+class AIMPPlaylistListener;
+class AIMPPlaylistManagerListener;
+AIMPPlaylistManagerListener* g_managerListener = nullptr;  // глобальный слушатель менеджера
+std::mutex g_listenersMutex;
+// Набор {playlist_ptr -> listener_ptr} — для снятия подписки при Removed/Finalize
+struct PlaylistListenerEntry {
+    IAIMPPlaylist* playlist;
+    AIMPPlaylistListener* listener;
+};
+std::vector<PlaylistListenerEntry> g_playlistListeners;
 
 // ==========================================
 // Утилиты
@@ -101,7 +115,7 @@ bool RunInMainThread(std::function<void()> fn) {
 }
 
 // ==========================================
-// Вспомогательные функции (вызываются ТОЛЬКО из главного потока)
+// PlaylistProps + GetFocusedIndex — вынесены выше для использования слушателями
 // ==========================================
 
 // IAIMPPlaylist реализует IAIMPPropertyList — получаем через QI
@@ -114,6 +128,278 @@ struct PlaylistProps {
     operator bool()               const { return ptr != nullptr; }
     IAIMPPropertyList* operator->() const { return ptr; }
 };
+
+int GetFocusedIndex(IAIMPPlaylist* pl) {
+    int idx = -1;
+    PlaylistProps p(pl);
+    if (p) p->GetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, &idx);
+    return idx;
+}
+
+// Установить фокус + selection на трек trackIdx в плейлисте pl.
+// Снимает selection со всех остальных треков, ставит на нужный.
+// Вызывать из главного потока.
+void SetPlaylistFocusAndSelection(IAIMPPlaylist* pl, int trackIdx) {
+    if (!pl) return;
+    // Устанавливаем FOCUSINDEX
+    PlaylistProps props(pl);
+    if (props) props->SetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, trackIdx);
+
+    // Снимаем selection со всех, ставим на нужный
+    int count = pl->GetItemCount();
+    for (int i = 0; i < count; i++) {
+        IAIMPPlaylistItem* item = nullptr;
+        if (pl->GetItem(i, IID_IAIMPPlaylistItem, (void**)&item) == S_OK && item) {
+            item->SetValueAsInt32(AIMP_PLAYLISTITEM_PROPID_SELECTED, (i == trackIdx) ? 1 : 0);
+            item->Release();
+        }
+    }
+}
+
+// ==========================================
+// Хелпер: найти индекс плейлиста по указателю IAIMPPlaylist*
+// Вызывать ТОЛЬКО из главного потока AIMP.
+// ==========================================
+int FindPlaylistIndex(IAIMPPlaylist* targetPl) {
+    if (!g_core || !targetPl) return -1;
+    IAIMPServicePlaylistManager* mgr = nullptr;
+    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr)
+        return -1;
+    int count = mgr->GetLoadedPlaylistCount();
+    int found = -1;
+    for (int i = 0; i < count; i++) {
+        IAIMPPlaylist* pl = nullptr;
+        if (mgr->GetLoadedPlaylist(i, &pl) == S_OK && pl) {
+            if (pl == targetPl) { found = i; pl->Release(); break; }
+            pl->Release();
+        }
+    }
+    mgr->Release();
+    return found;
+}
+
+// ==========================================
+// AIMPPlaylistListener — подписывается на конкретный плейлист.
+// Обновляет g_focusTrackIdx при изменении FOCUSINDEX в AIMP UI.
+// Вызывается AIMP из главного потока.
+// ==========================================
+class AIMPPlaylistListener : public IAIMPPlaylistListener {
+    LONG ref_ = 1;
+    IAIMPPlaylist* playlist_;  // weak ref — не AddRef, т.к. AIMP владеет плейлистом
+public:
+    explicit AIMPPlaylistListener(IAIMPPlaylist* pl) : playlist_(pl) {}
+
+    // IUnknown
+    HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IAIMPPlaylistListener) {
+            *ppv = static_cast<IAIMPPlaylistListener*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG WINAPI AddRef()  override { return InterlockedIncrement(&ref_); }
+    ULONG WINAPI Release() override {
+        LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IAIMPPlaylistListener
+    void WINAPI Activated() override {
+        // Вкладка плейлиста стала активной в UI — обновляем g_focusPlaylistIdx
+        int idx = FindPlaylistIndex(playlist_);
+        if (idx >= 0) {
+            // Читаем AIMP-ный фокус трека из этого плейлиста
+            int focusIdx = GetFocusedIndex(playlist_);
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            g_focusPlaylistIdx = idx;
+            if (focusIdx >= 0) g_focusTrackIdx = focusIdx;
+            else               g_focusTrackIdx = 0;
+        }
+    }
+
+    void WINAPI Changed(LongWord Flags) override {
+        if (Flags & AIMP_PLAYLIST_NOTIFY_FOCUSINDEX) {
+            // Фокус трека изменился в UI — синхронизируем только если это наш фокус-плейлист
+            int plIdx = FindPlaylistIndex(playlist_);
+            if (plIdx < 0) return;
+            int focusIdx = GetFocusedIndex(playlist_);
+            if (focusIdx < 0) return;
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            if (g_focusPlaylistIdx == plIdx) {
+                g_focusTrackIdx = focusIdx;
+            }
+        }
+    }
+
+    void WINAPI Removed() override {
+        // Плейлист удалён — удаляем себя из g_playlistListeners
+        // (AIMP автоматически снимает listener, но мы чистим нашу структуру)
+        std::lock_guard<std::mutex> lk(g_listenersMutex);
+        for (auto it = g_playlistListeners.begin(); it != g_playlistListeners.end(); ++it) {
+            if (it->playlist == playlist_) {
+                g_playlistListeners.erase(it);
+                break;
+            }
+        }
+    }
+};
+
+// Навесить IAIMPPlaylistListener на один плейлист (если ещё не подписаны).
+// Вызывать из главного потока.
+void AttachListenerToPlaylist(IAIMPPlaylist* pl) {
+    if (!pl) return;
+    {
+        std::lock_guard<std::mutex> lk(g_listenersMutex);
+        for (auto& e : g_playlistListeners) {
+            if (e.playlist == pl) return;  // уже подписаны
+        }
+    }
+    auto* listener = new AIMPPlaylistListener(pl);
+    if (pl->ListenerAdd(listener) == S_OK) {
+        std::lock_guard<std::mutex> lk(g_listenersMutex);
+        g_playlistListeners.push_back({pl, listener});
+    } else {
+        listener->Release();  // не удалось подписаться
+    }
+}
+
+// Навесить слушателей на ВСЕ загруженные плейлисты.
+// Вызывать из главного потока.
+void AttachListenerToAllPlaylists() {
+    if (!g_core) return;
+    IAIMPServicePlaylistManager* mgr = nullptr;
+    if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr)
+        return;
+    int count = mgr->GetLoadedPlaylistCount();
+    for (int i = 0; i < count; i++) {
+        IAIMPPlaylist* pl = nullptr;
+        if (mgr->GetLoadedPlaylist(i, &pl) == S_OK && pl) {
+            AttachListenerToPlaylist(pl);
+            pl->Release();
+        }
+    }
+    mgr->Release();
+}
+
+// Снять всех слушателей со всех плейлистов.
+// Вызывать из главного потока.
+void DetachAllPlaylistListeners() {
+    std::lock_guard<std::mutex> lk(g_listenersMutex);
+    for (auto& e : g_playlistListeners) {
+        if (e.playlist && e.listener) {
+            e.playlist->ListenerRemove(e.listener);
+            e.listener->Release();
+        }
+    }
+    g_playlistListeners.clear();
+}
+
+// ==========================================
+// AIMPPlaylistManagerListener — глобальный слушатель менеджера плейлистов.
+// Регистрируется через g_core->RegisterExtension(IID_IAIMPServicePlaylistManager, ...).
+// Вызывается AIMP из главного потока.
+// ==========================================
+class AIMPPlaylistManagerListener : public IAIMPExtensionPlaylistManagerListener {
+    LONG ref_ = 1;
+public:
+    // IUnknown
+    HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IAIMPExtensionPlaylistManagerListener) {
+            *ppv = static_cast<IAIMPExtensionPlaylistManagerListener*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG WINAPI AddRef()  override { return InterlockedIncrement(&ref_); }
+    ULONG WINAPI Release() override {
+        LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    // IAIMPExtensionPlaylistManagerListener
+    void WINAPI PlaylistActivated(IAIMPPlaylist* Playlist) override {
+        // Пользователь переключил вкладку в AIMP UI
+        int idx = FindPlaylistIndex(Playlist);
+        if (idx >= 0) {
+            int focusIdx = GetFocusedIndex(Playlist);
+            std::lock_guard<std::mutex> lk(g_focusMutex);
+            g_focusPlaylistIdx = idx;
+            if (focusIdx >= 0) g_focusTrackIdx = focusIdx;
+            else               g_focusTrackIdx = 0;
+        }
+    }
+
+    void WINAPI PlaylistAdded(IAIMPPlaylist* Playlist) override {
+        // Новый плейлист — подписываемся на него
+        AttachListenerToPlaylist(Playlist);
+    }
+
+    void WINAPI PlaylistRemoved(IAIMPPlaylist* Playlist) override {
+        // Плейлист удалён — слушатель снимается автоматически в AIMPPlaylistListener::Removed()
+        // Корректируем фокус если удалённый плейлист был в фокусе
+        std::lock_guard<std::mutex> lk(g_focusMutex);
+        // После удаления индексы могут сдвинуться, просто зажимаем
+        // (более точная коррекция произойдёт при следующем обращении в GetPlayerStatus)
+    }
+};
+
+// Инициализация системы синхронизации фокуса (вызывать из Initialize)
+void InitFocusSync() {
+    if (!g_core) return;
+    // 1. Регистрируем глобальный слушатель менеджера
+    g_managerListener = new AIMPPlaylistManagerListener();
+    g_managerListener->AddRef();  // удерживаем ссылку
+    g_core->RegisterExtension(IID_IAIMPServicePlaylistManager, g_managerListener);
+
+    // 2. Навешиваем слушателей на все уже загруженные плейлисты
+    //    + синхронизируем начальный фокус с текущим активным плейлистом AIMP
+    RunInMainThread([&]() {
+        AttachListenerToAllPlaylists();
+
+        // Начальная синхронизация: берём активный плейлист AIMP как начальный фокус
+        IAIMPServicePlaylistManager* mgr = nullptr;
+        if (g_core->QueryInterface(IID_IAIMPServicePlaylistManager, (void**)&mgr) != S_OK || !mgr)
+            return;
+        IAIMPPlaylist* activePl = nullptr;
+        if (mgr->GetActivePlaylist(&activePl) == S_OK && activePl) {
+            int idx = FindPlaylistIndex(activePl);
+            if (idx >= 0) {
+                int focusIdx = GetFocusedIndex(activePl);
+                std::lock_guard<std::mutex> lk(g_focusMutex);
+                g_focusPlaylistIdx = idx;
+                g_focusTrackIdx = (focusIdx >= 0) ? focusIdx : 0;
+            }
+            activePl->Release();
+        }
+        mgr->Release();
+    });
+}
+
+// Очистка системы синхронизации фокуса (вызывать из Finalize)
+void FinalizeFocusSync() {
+    // Снимаем слушателей с плейлистов (должно быть в главном потоке, но Finalize вызывается оттуда)
+    DetachAllPlaylistListeners();
+
+    // Дерегистрируем глобальный слушатель менеджера
+    if (g_core && g_managerListener) {
+        g_core->UnregisterExtension(g_managerListener);
+    }
+    if (g_managerListener) {
+        g_managerListener->Release();
+        g_managerListener = nullptr;
+    }
+}
+
+// ==========================================
+// Вспомогательные функции (вызываются ТОЛЬКО из главного потока)
+// (PlaylistProps и GetFocusedIndex определены выше)
+// ==========================================
 
 std::string GetPlaylistName(IAIMPPlaylist* pl) {
     PlaylistProps p(pl);
@@ -143,13 +429,6 @@ int GetPlayingIndex(IAIMPPlaylist* pl) {
     int idx = -1;
     PlaylistProps p(pl);
     if (p) p->GetValueAsInt32(AIMP_PLAYLIST_PROPID_PLAYINGINDEX, &idx);
-    return idx;
-}
-
-int GetFocusedIndex(IAIMPPlaylist* pl) {
-    int idx = -1;
-    PlaylistProps p(pl);
-    if (p) p->GetValueAsInt32(AIMP_PLAYLIST_PROPID_FOCUSINDEX, &idx);
     return idx;
 }
 
@@ -287,25 +566,7 @@ json GetPlayerStatus() {
     r["repeat"]          = MsgGetBool(AIMP_MSG_PROPERTY_REPEAT);
     r["auto_jump"]       = MsgGetBool(AIMP_MSG_PROPERTY_AUTOJUMP_TO_NEXT_TRACK);
 
-    // --- Часть 1.6: Next track через IAIMPServicePlaybackQueue (thread-safe) ---
     r["next_track"] = nullptr;
-    IAIMPServicePlaybackQueue* queue = nullptr;
-    if (g_core->QueryInterface(IID_IAIMPServicePlaybackQueue, (void**)&queue) == S_OK && queue) {
-        IAIMPPlaybackQueueItem* nextItem = nullptr;
-        if (queue->GetNextTrack(&nextItem) == S_OK && nextItem) {
-            // Достаём IAIMPPlaylistItem из queue item
-            IAIMPPlaylistItem* plItem = nullptr;
-            if (nextItem->GetValueAsObject(AIMP_PLAYBACKQUEUEITEM_PROPID_PLAYLISTITEM,
-                    IID_IAIMPPlaylistItem, (void**)&plItem) == S_OK && plItem) {
-                json nt;
-                GetFileInfo(plItem, nt);
-                r["next_track"] = nt;
-                plItem->Release();
-            }
-            nextItem->Release();
-        }
-        queue->Release();
-    }
 
     // --- Часть 2: Данные плейлистов/треков — требуют главного потока ---
     // playing_playlist, playing_track, focus_playlist, focus_track
@@ -396,6 +657,24 @@ json GetPlayerStatus() {
             r["focus_track"]    = nullptr;
         }
 
+        // --- next_track: следующий трек в очереди воспроизведения ---
+        IAIMPServicePlaybackQueue* queue = nullptr;
+        if (g_core->QueryInterface(IID_IAIMPServicePlaybackQueue, (void**)&queue) == S_OK && queue) {
+            IAIMPPlaybackQueueItem* nextItem = nullptr;
+            if (queue->GetNextTrack(&nextItem) == S_OK && nextItem) {
+                IAIMPPlaylistItem* plItem = nullptr;
+                if (nextItem->GetValueAsObject(AIMP_PLAYBACKQUEUEITEM_PROPID_PLAYLISTITEM,
+                        IID_IAIMPPlaylistItem, (void**)&plItem) == S_OK && plItem) {
+                    json nt;
+                    GetFileInfo(plItem, nt);
+                    r["next_track"] = nt;
+                    plItem->Release();
+                }
+                nextItem->Release();
+            }
+            queue->Release();
+        }
+
         mgr->Release();
     });
 
@@ -423,6 +702,14 @@ json FocusPlaylistShift(int delta) {
             newIdx = ((g_focusPlaylistIdx + delta) % total + total) % total;
             g_focusPlaylistIdx = newIdx;
             g_focusTrackIdx    = 0;  // при смене плейлиста — трек сбрасываем на первый
+        }
+
+        // Переключаем вкладку в UI AIMP + выделяем первый трек
+        IAIMPPlaylist* newPl = nullptr;
+        if (mgr->GetLoadedPlaylist(newIdx, &newPl) == S_OK && newPl) {
+            mgr->SetActivePlaylist(newPl);
+            SetPlaylistFocusAndSelection(newPl, 0);
+            newPl->Release();
         }
 
         json fp;
@@ -464,9 +751,7 @@ json FocusTrackShift(int delta) {
         }
 
         int total = pl->GetItemCount();
-        pl->Release();
-
-        if (total == 0) { mgr->Release(); r["error"] = "playlist is empty"; return; }
+        if (total == 0) { pl->Release(); mgr->Release(); r["error"] = "playlist is empty"; return; }
 
         int newTrackIdx;
         {
@@ -474,6 +759,10 @@ json FocusTrackShift(int delta) {
             newTrackIdx = ((g_focusTrackIdx + delta) % total + total) % total;
             g_focusTrackIdx = newTrackIdx;
         }
+
+        // Устанавливаем фокус + selection трека в UI AIMP
+        SetPlaylistFocusAndSelection(pl, newTrackIdx);
+        pl->Release();
 
         json ft;
         FillTrackJson(mgr, plIdx, newTrackIdx, ft);
@@ -1072,6 +1361,8 @@ public:
 
     HRESULT WINAPI Initialize(IAIMPCore* core) override {
         g_core = core;
+        // Запускаем синхронизацию фокуса с UI AIMP
+        InitFocusSync();
         g_serverThread = std::thread(RunHttpServer);
         g_serverThread.detach();
         return S_OK;
@@ -1079,6 +1370,8 @@ public:
     HRESULT WINAPI Finalize() override {
         g_running = false;
         Sleep(300);
+        // Останавливаем синхронизацию фокуса
+        FinalizeFocusSync();
         g_core = nullptr;
         return S_OK;
     }
