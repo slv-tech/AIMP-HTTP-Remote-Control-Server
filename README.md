@@ -1,12 +1,12 @@
 # AIMP HTTP Control Plugin
 
-Плагин для удалённого управления AIMP v6 через HTTP API. Доступен для Windows (`.dll`) и Linux (`.so`).
+Плагин для удалённого управления AIMP через HTTP API. Доступен для Windows (`.dll`).
 
 ---
 
 ## Сборка
 
-### Windows (cross-compile)
+### Windows
 
 ```bash
 x86_64-w64-mingw32-g++ \
@@ -21,50 +21,17 @@ x86_64-w64-mingw32-g++ \
     -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
 ```
 
-### Linux
-
-```bash
-g++ -shared -fPIC -O2 -std=c++17 \
-    -isystem sdk_linux -I sdk -I third_party -I . \
-    aimp_http_plugin_linux.cpp -o aimp_httpcontrol.so -lpthread
-```
-
----
-
-## Установка
-
-### Через `.aimppack` (рекомендуется)
-
-1. Откройте AIMP → Настройки → Плагины
-2. Нажмите «Установить» (или перетащите файл в окно AIMP)
-3. Выберите `AimpHttpControl.aimppack`
-4. Включите плагин в списке
-
-`AimpHttpControl.aimppack` содержит:
-- `AimpHttpControl/x64/AimpHttpControl64.dll` — Windows 64-bit
-- `AimpHttpControl/aimp_httpcontrol.so` — Linux
-
-### Вручную (Linux)
-
-```bash
-sudo mkdir -p /opt/aimp/Plugins/aimp_httpcontrol/
-sudo cp aimp_httpcontrol.so /opt/aimp/Plugins/aimp_httpcontrol/
-```
-
-После установки перезапустите AIMP.
-
----
 
 ## Настройки
 
-Настройки хранятся в файле конфигурации AIMP (`AIMP.ini`):
-
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
-| Port | `3553` | Порт HTTP сервера |
+| Port | `19122` | Порт HTTP сервера |
 | Allowed | `127.0.0.1` | Разрешённые IP (`*` — все) |
 
 Изменить можно через меню AIMP: Настройки → Плагины → AIMP HTTP Control.
+
+ // TODO: Сохранение настроек
 
 ---
 
