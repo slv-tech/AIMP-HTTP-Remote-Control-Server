@@ -26,15 +26,20 @@ using json = nlohmann::json;
 #include "sdk/apiFileManager.h"
 #include "sdk/apiThreading.h"
 #include "sdk/apiMessages.h"
+#include "sdk/apiOptions.h"
 
 // ==========================================
 // Глобальные переменные
 // ==========================================
+HINSTANCE  g_hInstance = nullptr;  // DLL HINSTANCE для диалогов
 IAIMPCore* g_core    = nullptr;
 std::mutex g_mutex;
-int        g_port    = 3553;
+int        g_port    = 19122;
+// Bind mode: 0 = 127.0.0.1 (localhost only), 1 = LAN (private ranges), 2 = 0.0.0.0 (all interfaces)
+int        g_bindMode = 2;
 bool       g_running = false;
 std::thread g_serverThread;
+SOCKET     g_serverSocket = INVALID_SOCKET;  // для корректного перезапуска
 
 // Фокус навигации (для Bitfocus: < плейлист >, < трек >)
 // Хранит индекс плейлиста и трека которые пользователь выбрал кнопками.
@@ -1100,17 +1105,36 @@ void RunHttpServer() {
     int opt = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
     sockaddr_in addr{};
-    addr.sin_family = AF_INET; addr.sin_port = htons(g_port); addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_family = AF_INET;
+    addr.sin_port   = htons(g_port);
+    // Bind mode: 0 = localhost, 1 = LAN (0.0.0.0 but we could filter — for now same as 2), 2 = all
+    if (g_bindMode == 0)
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    else
+        addr.sin_addr.s_addr = INADDR_ANY;
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(srv); WSACleanup(); return; }
     listen(srv, SOMAXCONN);
+    g_serverSocket = srv;
     g_running = true;
 
     while (g_running) {
         fd_set rs; FD_ZERO(&rs); FD_SET(srv, &rs);
         timeval to{1, 0};
         if (select(0, &rs, nullptr, nullptr, &to) <= 0) continue;
-        SOCKET cl = accept(srv, nullptr, nullptr);
+        sockaddr_in clientAddr{};
+        int clientLen = sizeof(clientAddr);
+        SOCKET cl = accept(srv, (sockaddr*)&clientAddr, &clientLen);
         if (cl == INVALID_SOCKET) continue;
+
+        // LAN mode: фильтруем — допускаем только private ranges + localhost
+        if (g_bindMode == 1) {
+            unsigned long ip = ntohl(clientAddr.sin_addr.s_addr);
+            bool isPrivate = (ip >> 24 == 127)                       // 127.x.x.x
+                          || (ip >> 24 == 10)                        // 10.x.x.x
+                          || ((ip >> 20) == (172 << 4 | 1))          // 172.16-31.x.x
+                          || ((ip >> 16) == (192 << 8 | 168));       // 192.168.x.x
+            if (!isPrivate) { closesocket(cl); continue; }
+        }
 
         char buf[16384];
         int n = recv(cl, buf, sizeof(buf)-1, 0);
@@ -1327,8 +1351,210 @@ void RunHttpServer() {
         }
         closesocket(cl);
     }
+    g_serverSocket = INVALID_SOCKET;
     closesocket(srv);
     WSACleanup();
+}
+
+// ==========================================
+// Настройки (INI)
+// ==========================================
+std::wstring GetSettingsPath() {
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(g_hInstance, path, MAX_PATH);
+    std::wstring s(path);
+    auto pos = s.rfind(L'\\');
+    if (pos != std::wstring::npos) s = s.substr(0, pos + 1);
+    s += L"AimpHttpControl.ini";
+    return s;
+}
+
+void LoadSettings() {
+    std::wstring ini = GetSettingsPath();
+    g_port     = GetPrivateProfileIntW(L"Server", L"Port", 3553, ini.c_str());
+    g_bindMode = GetPrivateProfileIntW(L"Server", L"BindMode", 2, ini.c_str());
+    if (g_port < 1 || g_port > 65535) g_port = 3553;
+    if (g_bindMode < 0 || g_bindMode > 2) g_bindMode = 2;
+}
+
+void SaveSettings() {
+    std::wstring ini = GetSettingsPath();
+    wchar_t buf[16];
+    wsprintfW(buf, L"%d", g_port);
+    WritePrivateProfileStringW(L"Server", L"Port", buf, ini.c_str());
+    wsprintfW(buf, L"%d", g_bindMode);
+    WritePrivateProfileStringW(L"Server", L"BindMode", buf, ini.c_str());
+}
+
+// ==========================================
+// Win32 Диалог настроек
+// ==========================================
+// Control IDs
+#define IDC_PORT_EDIT    101
+#define IDC_BIND_COMBO   102
+#define IDC_BTN_OK       103
+#define IDC_BTN_CANCEL   104
+#define IDC_STATUS_LABEL 105
+
+void RestartHttpServer();  // forward decl
+
+INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        // Заполняем порт
+        SetDlgItemInt(hDlg, IDC_PORT_EDIT, g_port, FALSE);
+
+        // Заполняем ComboBox
+        HWND hCombo = GetDlgItem(hDlg, IDC_BIND_COMBO);
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"127.0.0.1 (localhost only)");
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"LAN (private networks)");
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"0.0.0.0 (all interfaces)");
+        SendMessageW(hCombo, CB_SETCURSEL, g_bindMode, 0);
+
+        // Статус
+        wchar_t status[128];
+        const wchar_t* bindStr = (g_bindMode == 0) ? L"127.0.0.1" : (g_bindMode == 1) ? L"LAN" : L"0.0.0.0";
+        wsprintfW(status, L"Server running on %s:%d", bindStr, g_port);
+        SetDlgItemTextW(hDlg, IDC_STATUS_LABEL, status);
+
+        return TRUE;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case IDC_BTN_OK: {
+            BOOL ok = FALSE;
+            int port = GetDlgItemInt(hDlg, IDC_PORT_EDIT, &ok, FALSE);
+            if (!ok || port < 1 || port > 65535) {
+                MessageBoxW(hDlg, L"Port must be between 1 and 65535", L"Invalid Port", MB_OK | MB_ICONWARNING);
+                return TRUE;
+            }
+            int bind = (int)SendDlgItemMessageW(hDlg, IDC_BIND_COMBO, CB_GETCURSEL, 0, 0);
+            if (bind < 0 || bind > 2) bind = 2;
+
+            bool needRestart = (port != g_port || bind != g_bindMode);
+            g_port = port;
+            g_bindMode = bind;
+            SaveSettings();
+
+            if (needRestart) {
+                RestartHttpServer();
+            }
+            EndDialog(hDlg, IDOK);
+            return TRUE;
+        }
+        case IDC_BTN_CANCEL:
+        case IDCANCEL:
+            EndDialog(hDlg, IDCANCEL);
+            return TRUE;
+        }
+        break;
+    case WM_CLOSE:
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+HWND CreateSettingsDialog(HWND parent) {
+    // Создаём диалог в памяти (DLGTEMPLATE) — не нужен .rc файл
+    // Размер 320x180 dialog units
+    const int DLG_W = 280, DLG_H = 130;
+
+    // Выделяем буфер для template
+    WORD dlgBuf[2048] = {};
+    WORD* p = dlgBuf;
+
+    // DLGTEMPLATE
+    DLGTEMPLATE* dlg = (DLGTEMPLATE*)p;
+    dlg->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    dlg->cdit  = 7;  // количество контролов
+    dlg->x = 0; dlg->y = 0; dlg->cx = DLG_W; dlg->cy = DLG_H;
+    p = (WORD*)(dlg + 1);
+    *p++ = 0; // menu
+    *p++ = 0; // class
+    // title "AIMP HTTP Control — Settings"
+    const wchar_t* title = L"AIMP HTTP Control \x2014 Settings";
+    int titleLen = (int)wcslen(title) + 1;
+    memcpy(p, title, titleLen * 2); p += titleLen;
+
+    // Helper lambda: add DLGITEMTEMPLATE
+    auto addItem = [&](DWORD style, int x, int y, int cx, int cy, WORD id, const wchar_t* cls, const wchar_t* text) {
+        // Align to DWORD
+        if ((ULONG_PTR)p & 2) p++;
+        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
+        item->style = style | WS_CHILD | WS_VISIBLE;
+        item->x = (short)x; item->y = (short)y; item->cx = (short)cx; item->cy = (short)cy;
+        item->id = id;
+        p = (WORD*)(item + 1);
+        // class
+        int clsLen = (int)wcslen(cls) + 1;
+        memcpy(p, cls, clsLen * 2); p += clsLen;
+        // text
+        int txtLen = (int)wcslen(text) + 1;
+        memcpy(p, text, txtLen * 2); p += txtLen;
+        *p++ = 0; // extra
+    };
+
+    // Label "Port:"
+    addItem(SS_LEFT, 14, 16, 30, 10, (WORD)-1, L"STATIC", L"Port:");
+    // Edit (port)
+    addItem(ES_NUMBER | WS_BORDER | WS_TABSTOP, 50, 14, 50, 14, IDC_PORT_EDIT, L"EDIT", L"3553");
+    // Label "Bind:"
+    addItem(SS_LEFT, 14, 38, 30, 10, (WORD)-1, L"STATIC", L"Bind:");
+    // ComboBox (bind mode)
+    addItem(CBS_DROPDOWNLIST | WS_TABSTOP, 50, 36, 160, 80, IDC_BIND_COMBO, L"COMBOBOX", L"");
+    // Status label
+    addItem(SS_LEFT, 14, 62, 250, 10, IDC_STATUS_LABEL, L"STATIC", L"");
+    // OK button
+    addItem(BS_DEFPUSHBUTTON | WS_TABSTOP, 100, 90, 60, 18, IDC_BTN_OK, L"BUTTON", L"Save");
+    // Cancel button
+    addItem(WS_TABSTOP, 170, 90, 60, 18, IDC_BTN_CANCEL, L"BUTTON", L"Cancel");
+
+    return (HWND)(INT_PTR)DialogBoxIndirectW(g_hInstance, (DLGTEMPLATE*)dlgBuf, parent, SettingsDlgProc);
+}
+
+// ==========================================
+// IAIMPExternalSettingsDialog — кнопка Settings в менеджере плагинов
+// ==========================================
+class PluginSettingsDialog : public IAIMPExternalSettingsDialog {
+    LONG ref_ = 1;
+public:
+    HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == IID_IUnknown || riid == IID_IAIMPExternalSettingsDialog) {
+            *ppv = static_cast<IAIMPExternalSettingsDialog*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG WINAPI AddRef()  override { return InterlockedIncrement(&ref_); }
+    ULONG WINAPI Release() override {
+        LONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return r;
+    }
+
+    void WINAPI Show(HWND ParentWindow) override {
+        CreateSettingsDialog(ParentWindow);
+    }
+};
+
+// ==========================================
+// Перезапуск HTTP сервера
+// ==========================================
+void RestartHttpServer() {
+    // Останавливаем текущий сервер
+    g_running = false;
+    // Закрываем серверный сокет чтобы прервать select/accept
+    if (g_serverSocket != INVALID_SOCKET) {
+        closesocket(g_serverSocket);
+        g_serverSocket = INVALID_SOCKET;
+    }
+    Sleep(300);
+    // Запускаем заново
+    g_serverThread = std::thread(RunHttpServer);
+    g_serverThread.detach();
 }
 
 // ==========================================
@@ -1336,10 +1562,19 @@ void RunHttpServer() {
 // ==========================================
 class HttpControlPlugin : public IAIMPPlugin {
     LONG ref_ = 1;
+    PluginSettingsDialog* settingsDlg_ = nullptr;
 public:
-    virtual ~HttpControlPlugin() = default;
+    virtual ~HttpControlPlugin() {
+        if (settingsDlg_) settingsDlg_->Release();
+    }
     HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
+        if (riid == IID_IAIMPExternalSettingsDialog) {
+            if (!settingsDlg_) settingsDlg_ = new PluginSettingsDialog();
+            *ppv = static_cast<IAIMPExternalSettingsDialog*>(settingsDlg_);
+            settingsDlg_->AddRef();
+            return S_OK;
+        }
         *ppv = static_cast<IAIMPPlugin*>(this); AddRef(); return S_OK;
     }
     ULONG WINAPI AddRef()  override { return InterlockedIncrement(&ref_); }
@@ -1347,8 +1582,8 @@ public:
 
     TChar* WINAPI InfoGet(int Index) override {
         static wchar_t n[] = L"AIMP HTTP Control API v2";
-        static wchar_t a[] = L"DebianDev";
-        static wchar_t d[] = L"Full REST API on port 3553";
+        static wchar_t a[] = L"SLV Dev Team";
+        static wchar_t d[] = L"Full REST API for AIMP";
         switch (Index) {
             case AIMP_PLUGIN_INFO_NAME:              return n;
             case AIMP_PLUGIN_INFO_AUTHOR:            return a;
@@ -1361,6 +1596,8 @@ public:
 
     HRESULT WINAPI Initialize(IAIMPCore* core) override {
         g_core = core;
+        // Загружаем настройки из INI
+        LoadSettings();
         // Запускаем синхронизацию фокуса с UI AIMP
         InitFocusSync();
         g_serverThread = std::thread(RunHttpServer);
@@ -1369,6 +1606,10 @@ public:
     }
     HRESULT WINAPI Finalize() override {
         g_running = false;
+        if (g_serverSocket != INVALID_SOCKET) {
+            closesocket(g_serverSocket);
+            g_serverSocket = INVALID_SOCKET;
+        }
         Sleep(300);
         // Останавливаем синхронизацию фокуса
         FinalizeFocusSync();
@@ -1383,4 +1624,7 @@ extern "C" __declspec(dllexport) HRESULT WINAPI AIMPPluginGetHeader(IAIMPPlugin*
     return S_OK;
 }
 
-BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }
+BOOL WINAPI DllMain(HINSTANCE hInstDLL, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) g_hInstance = hInstDLL;
+    return TRUE;
+}

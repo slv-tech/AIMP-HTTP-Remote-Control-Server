@@ -1,4 +1,12 @@
-## Команда сборки:
+# AIMP HTTP Control Plugin
+
+Плагин для удалённого управления AIMP v6 через HTTP API. Доступен для Windows (`.dll`) и Linux (`.so`).
+
+---
+
+## Сборка
+
+### Windows (cross-compile)
 
 ```bash
 x86_64-w64-mingw32-g++ \
@@ -6,14 +14,61 @@ x86_64-w64-mingw32-g++ \
     -Wno-missing-braces -Wno-delete-non-virtual-dtor \
     -D_WIN32_WINNT=0x0A00 \
     -I. -Isdk -Ithird_party \
-    aimp_http_server.cpp \
+    aimp_http_plugin.cpp \
     -shared -o AimpHttpControl64.dll \
     -lws2_32 -luuid -lkernel32 -luser32 \
     -static-libgcc -static-libstdc++ \
     -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
 ```
 
-## Полный список API эндпоинтов:
+### Linux
+
+```bash
+g++ -shared -fPIC -O2 -std=c++17 \
+    -isystem sdk_linux -I sdk -I third_party -I . \
+    aimp_http_plugin_linux.cpp -o aimp_httpcontrol.so -lpthread
+```
+
+---
+
+## Установка
+
+### Через `.aimppack` (рекомендуется)
+
+1. Откройте AIMP → Настройки → Плагины
+2. Нажмите «Установить» (или перетащите файл в окно AIMP)
+3. Выберите `AimpHttpControl.aimppack`
+4. Включите плагин в списке
+
+`AimpHttpControl.aimppack` содержит:
+- `AimpHttpControl/x64/AimpHttpControl64.dll` — Windows 64-bit
+- `AimpHttpControl/aimp_httpcontrol.so` — Linux
+
+### Вручную (Linux)
+
+```bash
+sudo mkdir -p /opt/aimp/Plugins/aimp_httpcontrol/
+sudo cp aimp_httpcontrol.so /opt/aimp/Plugins/aimp_httpcontrol/
+```
+
+После установки перезапустите AIMP.
+
+---
+
+## Настройки
+
+Настройки хранятся в файле конфигурации AIMP (`AIMP.ini`):
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| Port | `3553` | Порт HTTP сервера |
+| Allowed | `127.0.0.1` | Разрешённые IP (`*` — все) |
+
+Изменить можно через меню AIMP: Настройки → Плагины → AIMP HTTP Control.
+
+---
+
+## API эндпоинты
 
 | Метод | Путь | Описание |
 |-------|------|----------|
@@ -39,4 +94,3 @@ x86_64-w64-mingw32-g++ \
 | GET | `/api/playlist/{id}/tracks` | Треки в плейлисте |
 | POST | `/api/playlist/{id}/play?track=5` | Запустить трек |
 
-Плагин полностью готов! 🚀
