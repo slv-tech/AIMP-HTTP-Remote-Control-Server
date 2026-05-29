@@ -1360,13 +1360,19 @@ void RunHttpServer() {
 // Настройки (INI)
 // ==========================================
 std::wstring GetSettingsPath() {
+    wchar_t appData[MAX_PATH] = {};
+    if (GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
+        std::wstring dir = std::wstring(appData) + L"\\AIMP";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir + L"\\AimpHttpControl.ini";
+    }
+    // Fallback: рядом с DLL
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(g_hInstance, path, MAX_PATH);
     std::wstring s(path);
     auto pos = s.rfind(L'\\');
     if (pos != std::wstring::npos) s = s.substr(0, pos + 1);
-    s += L"AimpHttpControl.ini";
-    return s;
+    return s + L"AimpHttpControl.ini";
 }
 
 void LoadSettings() {
