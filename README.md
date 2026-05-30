@@ -1,11 +1,16 @@
 # AIMP HTTP Remote Control
-Плагин для удаленного управления AIMP через HTTP API. Работает с версией плеера 5.40.2716 и старше. Доступен для Windows (`.dll`). Создан для управления плеером в Bitfocus Companion через соответствующий модуль. Работает с Companion 4.3.2 и старше. Модуль для Companion доступен в каталоге модулей.
+
+[Русский](#русский) | [English](#english)
 
 ---
 
-## Сборка
+## Русский
 
-### Windows
+Плагин для удалённого управления AIMP через HTTP API. Работает с версией плеера 5.40.2716 и старше. Доступен для Windows (`.dll`). Создан для управления плеером в Bitfocus Companion через соответствующий модуль. Работает с Companion 4.3.2 и старше. Модуль для Companion доступен в каталоге модулей.
+
+### Сборка
+
+#### Windows
 
 ```bash
 x86_64-w64-mingw32-g++ \
@@ -20,22 +25,16 @@ x86_64-w64-mingw32-g++ \
     -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
 ```
 
-
-## Настройки
+### Настройки
 
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
-| Port | `19122` | Порт HTTP сервера, задаеется любой при необходимости |
-| Bind | `127.0.0.1` | `127.0.0.1` - Localhost; `LAN` - слушает все интерфейсы только в локальной сети; `0.0.0.0` - слушает все интерфейсы, включая внешние ip
- |
+| Port | `19122` | Порт HTTP сервера, задаётся любой при необходимости |
+| Bind | `127.0.0.1` | `127.0.0.1` — Localhost; `LAN` — слушает все интерфейсы только в локальной сети; `0.0.0.0` — слушает все интерфейсы, включая внешние IP |
 
-Изменить можно через меню AIMP: Настройки → Плагины → AIMP HTTP Remote Control. Все настройки сохряняются при перезапуске плеера.
+Изменить можно через меню AIMP: **Настройки → Плагины → AIMP HTTP Remote Control**. Все настройки сохраняются при перезапуске плеера.
 
- // TODO: Сохранение настроек
-
----
-
-## API эндпоинты
+### API эндпоинты
 
 | Метод | Путь | Описание |
 |-------|------|----------|
@@ -61,3 +60,60 @@ x86_64-w64-mingw32-g++ \
 | GET | `/api/playlist/{id}/tracks` | Треки в плейлисте |
 | POST | `/api/playlist/{id}/play?track=5` | Запустить трек |
 
+---
+
+## English
+
+A plugin for remote control of AIMP via HTTP API. Compatible with AIMP version 5.40.2716 and above. Available for Windows (`.dll`). Designed for controlling the player in Bitfocus Companion via the corresponding module. Works with Companion 4.3.2 and above. The Companion module is available in the module catalog.
+
+### Build
+
+#### Windows
+
+```bash
+x86_64-w64-mingw32-g++ \
+    -std=c++17 -O2 -Wall \
+    -Wno-missing-braces -Wno-delete-non-virtual-dtor \
+    -D_WIN32_WINNT=0x0A00 \
+    -I. -Isdk -Ithird_party \
+    aimp_http_plugin.cpp \
+    -shared -o AimpHttpControl64.dll \
+    -lws2_32 -luuid -lkernel32 -luser32 \
+    -static-libgcc -static-libstdc++ \
+    -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
+```
+
+### Settings
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Port | `19122` | HTTP server port, can be changed as needed |
+| Bind | `127.0.0.1` | `127.0.0.1` — Localhost; `LAN` — listens on all interfaces within the local network only; `0.0.0.0` — listens on all interfaces, including external IPs |
+
+Settings can be changed via the AIMP menu: **Settings → Plugins → AIMP HTTP Remote Control**. All settings are preserved across player restarts.
+
+### API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/ping` | Health check |
+| GET | `/api/status` | Full player status |
+| GET | `/api/player` | Player state |
+| GET | `/api/player/state` | State only (playing/paused/stopped) |
+| GET | `/api/player/track` | Current track |
+| GET | `/api/player/track/focused` | Track under cursor |
+| GET | `/api/player/track/selected` | Selected tracks |
+| GET | `/api/player/position` | Playback position |
+| POST | `/api/player/position?position=30` | Set position |
+| GET | `/api/player/volume` | Volume |
+| POST | `/api/player/volume?volume=0.5` | Set volume |
+| POST | `/api/player/playpause` | Play/Pause |
+| POST | `/api/player/play?track=5` | Play / Play track |
+| POST | `/api/player/pause` | Pause |
+| POST | `/api/player/stop` | Stop |
+| POST | `/api/player/next` | Next track |
+| POST | `/api/player/prev` | Previous track |
+| GET | `/api/playlists` | List of playlists |
+| GET | `/api/playlist/{id}` | Playlist info |
+| GET | `/api/playlist/{id}/tracks` | Tracks in playlist |
+| POST | `/api/playlist/{id}/play?track=5` | Play track |
