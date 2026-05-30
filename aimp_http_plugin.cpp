@@ -1587,7 +1587,7 @@ public:
     ULONG WINAPI Release() override { LONG r = InterlockedDecrement(&ref_); if (r==0) delete this; return r; }
 
     TChar* WINAPI InfoGet(int Index) override {
-        static wchar_t n[] = L"AIMP HTTP Control API v2";
+        static wchar_t n[] = L"AIMP HTTP Remote Control";
         static wchar_t a[] = L"SLV Tech";
         static wchar_t d[] = L"Full REST API for AIMP";
         switch (Index) {
