@@ -10,29 +10,55 @@
 
 ### Сборка
 
-#### Windows
+#### Windows (x64)
 
 ```bash
 x86_64-w64-mingw32-g++ \
     -std=c++17 -O2 -Wall \
     -Wno-missing-braces -Wno-delete-non-virtual-dtor \
     -D_WIN32_WINNT=0x0A00 \
-    -I. -Isdk -Ithird_party \
+    -I. -isystem sdk -isystem third_party \
     aimp_http_plugin.cpp \
     -shared -o AimpHttpControl64.dll \
-    -lws2_32 -luuid -lkernel32 -luser32 \
+    -lws2_32 -liphlpapi -luuid -lkernel32 -luser32 -lgdi32 \
+    -static-libgcc -static-libstdc++ \
+    -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
+```
+
+#### Windows (x32)
+
+```bash
+i686-w64-mingw32-g++ \
+    -std=c++17 -O2 -Wall \
+    -Wno-missing-braces -Wno-delete-non-virtual-dtor \
+    -D_WIN32_WINNT=0x0A00 \
+    -I. -isystem sdk -isystem third_party \
+    aimp_http_plugin.cpp \
+    -shared -o AimpHttpControl32.dll \
+    -lws2_32 -liphlpapi -luuid -lkernel32 -luser32 -lgdi32 \
     -static-libgcc -static-libstdc++ \
     -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
 ```
 
 ### Настройки
 
+Открываются через меню AIMP: **Настройки → Плагины → HTTP Remote Control**. Все настройки сохраняются при перезапуске плеера.
+
+#### Сервер
+
 | Параметр | По умолчанию | Описание |
 |----------|-------------|----------|
-| Port | `19122` | Порт HTTP сервера, задаётся любой при необходимости |
-| Bind | `127.0.0.1` | `127.0.0.1` — Localhost; `LAN` — слушает все интерфейсы только в локальной сети; `0.0.0.0` — слушает все интерфейсы, включая внешние IP |
+| Port | `19122` | Порт HTTP сервера |
+| Listen interface | `All interfaces (0.0.0.0)` | `Localhost (127.0.0.1)` — только локальные подключения; `All interfaces (0.0.0.0)` — все интерфейсы; далее — список реальных сетевых интерфейсов системы (имя адаптера + IP) |
 
-Изменить можно через меню AIMP: **Настройки → Плагины → AIMP HTTP Remote Control**. Все настройки сохраняются при перезапуске плеера.
+#### Политика доступа
+
+| Параметр | По умолчанию | Описание |
+|----------|-------------|----------|
+| Allow access only from | выключено | Если включено, принимаются подключения только с адресов из списка ниже |
+| IP / CIDR list | — | Список разрешённых адресов через запятую. Поддерживаются точные адреса и CIDR-диапазоны, например: `192.168.1.5, 192.168.2.0/24, 10.0.0.0/8` |
+
+Если галочка снята — подключения принимаются с любых адресов (whitelist выключен).
 
 ### API эндпоинты
 
@@ -68,29 +94,55 @@ A plugin for remote control of AIMP via HTTP API. Compatible with AIMP version 5
 
 ### Build
 
-#### Windows
+#### Windows (x64)
 
 ```bash
 x86_64-w64-mingw32-g++ \
     -std=c++17 -O2 -Wall \
     -Wno-missing-braces -Wno-delete-non-virtual-dtor \
     -D_WIN32_WINNT=0x0A00 \
-    -I. -Isdk -Ithird_party \
+    -I. -isystem sdk -isystem third_party \
     aimp_http_plugin.cpp \
     -shared -o AimpHttpControl64.dll \
-    -lws2_32 -luuid -lkernel32 -luser32 \
+    -lws2_32 -liphlpapi -luuid -lkernel32 -luser32 -lgdi32 \
+    -static-libgcc -static-libstdc++ \
+    -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
+```
+
+#### Windows (x32)
+
+```bash
+i686-w64-mingw32-g++ \
+    -std=c++17 -O2 -Wall \
+    -Wno-missing-braces -Wno-delete-non-virtual-dtor \
+    -D_WIN32_WINNT=0x0A00 \
+    -I. -isystem sdk -isystem third_party \
+    aimp_http_plugin.cpp \
+    -shared -o AimpHttpControl32.dll \
+    -lws2_32 -liphlpapi -luuid -lkernel32 -luser32 -lgdi32 \
     -static-libgcc -static-libstdc++ \
     -Wl,-Bstatic -lstdc++ -lpthread -Wl,-Bdynamic
 ```
 
 ### Settings
 
+Accessible via the AIMP menu: **Settings → Plugins → HTTP Remote Control**. All settings are preserved across player restarts.
+
+#### Server
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| Port | `19122` | HTTP server port, can be changed as needed |
-| Bind | `127.0.0.1` | `127.0.0.1` — Localhost; `LAN` — listens on all interfaces within the local network only; `0.0.0.0` — listens on all interfaces, including external IPs |
+| Port | `19122` | HTTP server port |
+| Listen interface | `All interfaces (0.0.0.0)` | `Localhost (127.0.0.1)` — local connections only; `All interfaces (0.0.0.0)` — all interfaces; followed by a list of real network interfaces on the system (adapter name + IP) |
 
-Settings can be changed via the AIMP menu: **Settings → Plugins → AIMP HTTP Remote Control**. All settings are preserved across player restarts.
+#### Access policy
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Allow access only from | disabled | When enabled, only connections from addresses in the list below are accepted |
+| IP / CIDR list | — | Comma-separated list of allowed addresses. Supports exact addresses and CIDR ranges, e.g.: `192.168.1.5, 192.168.2.0/24, 10.0.0.0/8` |
+
+When the checkbox is unchecked, connections are accepted from any address (whitelist disabled).
 
 ### API Endpoints
 

@@ -5,6 +5,13 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <commctrl.h>
+
+// EM_SETCUEBANNER может отсутствовать в старых MinGW-заголовках
+#ifndef EM_SETCUEBANNER
+#define EM_SETCUEBANNER 0x1501
+#endif
 
 #include <thread>
 #include <mutex>
@@ -35,11 +42,16 @@ HINSTANCE  g_hInstance = nullptr;  // DLL HINSTANCE для диалогов
 IAIMPCore* g_core    = nullptr;
 std::mutex g_mutex;
 int        g_port    = 19122;
-// Bind mode: 0 = 127.0.0.1 (localhost only), 1 = LAN (private ranges), 2 = 0.0.0.0 (all interfaces)
-int        g_bindMode = 2;
+// Bind mode: 0 = 127.0.0.1 (localhost only), 1 = 0.0.0.0 (all interfaces), 2 = конкретный IP (g_bindIp)
+int        g_bindMode = 1;
+std::wstring g_bindIp = L"";         // IP для bindMode=2 (конкретный интерфейс)
 bool       g_running = false;
 std::thread g_serverThread;
 SOCKET     g_serverSocket = INVALID_SOCKET;  // для корректного перезапуска
+
+// Политика доступа: allowlist по IP/CIDR
+bool       g_allowListEnabled = false;
+std::string g_allowList = "";        // Список IP/CIDR через запятую
 
 // Фокус навигации (для Bitfocus: < плейлист >, < трек >)
 // Хранит индекс плейлиста и трека которые пользователь выбрал кнопками.
@@ -71,6 +83,130 @@ std::string WStr(const wchar_t* w) {
     std::string s(len - 1, 0);
     WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], len, nullptr, nullptr);
     return s;
+}
+
+// ==========================================
+// Утилиты: конвертация wstring <-> string (UTF-8)
+// ==========================================
+std::string WStrToUtf8(const std::wstring& w) {
+    if (w.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (len <= 0) return "";
+    std::string s(len - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &s[0], len, nullptr, nullptr);
+    return s;
+}
+
+std::wstring Utf8ToWStr(const std::string& s) {
+    if (s.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    if (len <= 0) return L"";
+    std::wstring w(len - 1, 0);
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &w[0], len);
+    return w;
+}
+
+// ==========================================
+// Перечисление сетевых интерфейсов (IPv4)
+// ==========================================
+struct NetworkInterface {
+    std::wstring displayName;  // "Ethernet (192.168.1.5)"
+    std::wstring ip;           // "192.168.1.5"
+};
+
+static std::vector<NetworkInterface> EnumNetworkInterfaces() {
+    std::vector<NetworkInterface> result;
+    ULONG bufLen = 15000;
+    std::vector<BYTE> buf(bufLen);
+    // Пробуем с увеличением буфера если не хватило
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        ULONG ret = GetAdaptersAddresses(AF_INET,
+            GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+            nullptr, (IP_ADAPTER_ADDRESSES*)buf.data(), &bufLen);
+        if (ret == ERROR_BUFFER_OVERFLOW) {
+            buf.resize(bufLen);
+            continue;
+        }
+        if (ret != ERROR_SUCCESS) break;
+        for (auto* a = (IP_ADAPTER_ADDRESSES*)buf.data(); a; a = a->Next) {
+            // Пропускаем loopback и неактивные
+            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+            if (a->OperStatus != IfOperStatusUp) continue;
+            for (auto* ua = a->FirstUnicastAddress; ua; ua = ua->Next) {
+                auto* sin = (sockaddr_in*)ua->Address.lpSockaddr;
+                wchar_t ipBuf[INET_ADDRSTRLEN] = {};
+                InetNtopW(AF_INET, &sin->sin_addr, ipBuf, INET_ADDRSTRLEN);
+                // Формируем отображаемое имя: "Friendly Name (IP)"
+                std::wstring friendly = a->FriendlyName ? std::wstring(a->FriendlyName) : L"Unknown";
+                NetworkInterface iface;
+                iface.ip          = ipBuf;
+                iface.displayName = friendly + L" (" + ipBuf + L")";
+                result.push_back(std::move(iface));
+            }
+        }
+        break;
+    }
+    return result;
+}
+
+// ==========================================
+// IP/CIDR allowlist — проверка входящего соединения
+// ==========================================
+
+// Парсит строку вида "192.168.1.5" -> uint32 (host byte order). Возвращает false при ошибке.
+static bool ParseIPv4(const std::string& s, uint32_t& out) {
+    unsigned int a, b, c, d;
+    if (sscanf(s.c_str(), "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
+    out = (a << 24) | (b << 16) | (c << 8) | d;
+    return true;
+}
+
+// Возвращает true если ip (host byte order) попадает в CIDR или совпадает с точным адресом.
+static bool MatchCIDR(uint32_t ip, const std::string& entry) {
+    auto slash = entry.find('/');
+    if (slash == std::string::npos) {
+        // точный адрес
+        uint32_t addr = 0;
+        return ParseIPv4(entry, addr) && (ip == addr);
+    }
+    std::string addrPart = entry.substr(0, slash);
+    std::string prefixPart = entry.substr(slash + 1);
+    uint32_t addr = 0;
+    if (!ParseIPv4(addrPart, addr)) return false;
+    int prefix = 0;
+    try { prefix = std::stoi(prefixPart); } catch (...) { return false; }
+    if (prefix < 0 || prefix > 32) return false;
+    if (prefix == 0) return true;  // 0.0.0.0/0 — все
+    uint32_t mask = prefix == 32 ? 0xFFFFFFFFu : ~((1u << (32 - prefix)) - 1u);
+    return (ip & mask) == (addr & mask);
+}
+
+// Разбивает строку по разделителю
+static std::vector<std::string> SplitTrim(const std::string& s, char delim) {
+    std::vector<std::string> result;
+    std::istringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, delim)) {
+        // trim spaces
+        auto start = token.find_first_not_of(" \t\r\n");
+        auto end   = token.find_last_not_of(" \t\r\n");
+        if (start != std::string::npos)
+            result.push_back(token.substr(start, end - start + 1));
+    }
+    return result;
+}
+
+// Проверяет, разрешён ли клиентский IP (в network byte order из accept()).
+// Если allowlist выключен — всегда true.
+bool IsAllowedClient(uint32_t clientIpNetworkOrder) {
+    if (!g_allowListEnabled) return true;
+    if (g_allowList.empty()) return false;  // список включён, но пуст — никого не пускаем
+    uint32_t ip = ntohl(clientIpNetworkOrder);
+    for (const auto& entry : SplitTrim(g_allowList, ',')) {
+        if (MatchCIDR(ip, entry)) return true;
+    }
+    return false;
 }
 
 // ==========================================
@@ -1107,11 +1243,15 @@ void RunHttpServer() {
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port   = htons(g_port);
-    // Bind mode: 0 = localhost, 1 = LAN (0.0.0.0 but we could filter — for now same as 2), 2 = all
-    if (g_bindMode == 0)
+    // Bind mode: 0 = localhost, 1 = 0.0.0.0 (все интерфейсы), 2 = конкретный IP из g_bindIp
+    if (g_bindMode == 0) {
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    else
+    } else if (g_bindMode == 2 && !g_bindIp.empty()) {
+        if (InetPtonW(AF_INET, g_bindIp.c_str(), &addr.sin_addr) != 1)
+            addr.sin_addr.s_addr = INADDR_ANY;  // fallback если адрес некорректен
+    } else {
         addr.sin_addr.s_addr = INADDR_ANY;
+    }
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(srv); WSACleanup(); return; }
     listen(srv, SOMAXCONN);
     g_serverSocket = srv;
@@ -1126,14 +1266,9 @@ void RunHttpServer() {
         SOCKET cl = accept(srv, (sockaddr*)&clientAddr, &clientLen);
         if (cl == INVALID_SOCKET) continue;
 
-        // LAN mode: фильтруем — допускаем только private ranges + localhost
-        if (g_bindMode == 1) {
-            unsigned long ip = ntohl(clientAddr.sin_addr.s_addr);
-            bool isPrivate = (ip >> 24 == 127)                       // 127.x.x.x
-                          || (ip >> 24 == 10)                        // 10.x.x.x
-                          || ((ip >> 20) == (172 << 4 | 1))          // 172.16-31.x.x
-                          || ((ip >> 16) == (192 << 8 | 168));       // 192.168.x.x
-            if (!isPrivate) { closesocket(cl); continue; }
+        // Allowlist: фильтруем по IP/CIDR если включена политика доступа
+        if (!IsAllowedClient(clientAddr.sin_addr.s_addr)) {
+            closesocket(cl); continue;
         }
 
         char buf[16384];
@@ -1306,7 +1441,7 @@ void RunHttpServer() {
                 }
             }
             else if (req.path == "/api" || req.path == "/api/") {
-                rsp["name"] = "AIMP HTTP Control API v2.0";
+                rsp["name"] = "AIMP HTTP Control API v0.8";
                 rsp["endpoints"] = json::array({
                     "GET  /api/player/status  — полный статус + shuffle/repeat/auto_jump/next_track",
                     "POST /api/player/play",
@@ -1381,6 +1516,17 @@ void LoadSettings() {
     g_bindMode = GetPrivateProfileIntW(L"Server", L"BindMode", 2, ini.c_str());
     if (g_port < 1 || g_port > 65535) g_port = 19122;
     if (g_bindMode < 0 || g_bindMode > 2) g_bindMode = 2;
+
+    // BindIP для bindMode=1
+    wchar_t bindIpBuf[64] = {};
+    GetPrivateProfileStringW(L"Server", L"BindIP", L"", bindIpBuf, 64, ini.c_str());
+    g_bindIp = std::wstring(bindIpBuf);
+
+    // AllowList
+    g_allowListEnabled = GetPrivateProfileIntW(L"Access", L"AllowListEnabled", 0, ini.c_str()) != 0;
+    wchar_t alBuf[1024] = {};
+    GetPrivateProfileStringW(L"Access", L"AllowList", L"", alBuf, 1024, ini.c_str());
+    g_allowList = WStrToUtf8(std::wstring(alBuf));
 }
 
 void SaveSettings() {
@@ -1390,147 +1536,134 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Server", L"Port", buf, ini.c_str());
     wsprintfW(buf, L"%d", g_bindMode);
     WritePrivateProfileStringW(L"Server", L"BindMode", buf, ini.c_str());
+    WritePrivateProfileStringW(L"Server", L"BindIP",
+        g_bindIp.empty() ? L"" : g_bindIp.c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Access", L"AllowListEnabled",
+        g_allowListEnabled ? L"1" : L"0", ini.c_str());
+    std::wstring alW = Utf8ToWStr(g_allowList);
+    WritePrivateProfileStringW(L"Access", L"AllowList",
+        alW.empty() ? L"" : alW.c_str(), ini.c_str());
 }
 
 // ==========================================
-// Win32 Диалог настроек
+// IAIMPOptionsDialogFrame — страница настроек в меню Options AIMP
 // ==========================================
-// Control IDs
-#define IDC_PORT_EDIT    101
-#define IDC_BIND_COMBO   102
-#define IDC_BTN_OK       103
-#define IDC_BTN_CANCEL   104
-#define IDC_STATUS_LABEL 105
+
+// Control IDs (используются внутри фрейма)
+#define IDC_PORT_EDIT       101
+#define IDC_BIND_COMBO      102
+#define IDC_STATUS_LABEL    103
+#define IDC_ALLOW_CHECK     104
+#define IDC_ALLOW_EDIT      105
+#define IDC_ALLOW_LABEL     106
 
 void RestartHttpServer();  // forward decl
 
-INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+// Временные значения настроек, редактируемые во фрейме (применяются по Notification(SAVE))
+static int   s_port            = 19122;
+static int   s_bindMode        = 1;   // 0=localhost, 1=all, 2=конкретный интерфейс
+static std::wstring s_bindIp   = L"";
+static bool  s_allowEnabled    = false;
+static std::string s_allowList = "";
+
+// Список интерфейсов, загружается при CreateFrame
+static std::vector<NetworkInterface> s_interfaces;
+
+// Дескриптор окна фрейма (дочернего для родительского окна настроек AIMP)
+static HWND  s_frameHwnd = nullptr;
+
+// Возвращает индекс в комбобоксе для текущего s_bindIp среди s_interfaces (или -1)
+static int FindInterfaceComboIndex(const std::wstring& ip) {
+    for (int i = 0; i < (int)s_interfaces.size(); ++i)
+        if (s_interfaces[i].ip == ip) return 2 + i;  // 0=localhost, 1=all, 2+i=интерфейсы
+    return -1;
+}
+
+static void UpdateFrameControls() {
+    if (!s_frameHwnd) return;
+    // bindMode=2 -> конкретный интерфейс, но поле IP скрыто — выбор через комбо
+    // allowList -> показываем поле только если галочка стоит
+    ShowWindow(GetDlgItem(s_frameHwnd, IDC_ALLOW_LABEL), s_allowEnabled ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(s_frameHwnd, IDC_ALLOW_EDIT),  s_allowEnabled ? SW_SHOW : SW_HIDE);
+}
+
+static LRESULT CALLBACK FrameWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_INITDIALOG: {
-        // Заполняем порт
-        SetDlgItemInt(hDlg, IDC_PORT_EDIT, g_port, FALSE);
-
-        // Заполняем ComboBox
-        HWND hCombo = GetDlgItem(hDlg, IDC_BIND_COMBO);
-        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"127.0.0.1 (localhost only)");
-        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"LAN (private networks)");
-        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"0.0.0.0 (all interfaces)");
-        SendMessageW(hCombo, CB_SETCURSEL, g_bindMode, 0);
-
-        // Статус
-        wchar_t status[128];
-        const wchar_t* bindStr = (g_bindMode == 0) ? L"127.0.0.1" : (g_bindMode == 1) ? L"LAN" : L"0.0.0.0";
-        wsprintfW(status, L"Server running on %s:%d", bindStr, g_port);
-        SetDlgItemTextW(hDlg, IDC_STATUS_LABEL, status);
-
-        return TRUE;
-    }
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case IDC_BTN_OK: {
-            BOOL ok = FALSE;
-            int port = GetDlgItemInt(hDlg, IDC_PORT_EDIT, &ok, FALSE);
-            if (!ok || port < 1 || port > 65535) {
-                MessageBoxW(hDlg, L"Port must be between 1 and 65535", L"Invalid Port", MB_OK | MB_ICONWARNING);
-                return TRUE;
+    case WM_COMMAND: {
+        WORD id = LOWORD(wParam);
+        WORD notif = HIWORD(wParam);
+        if (id == IDC_BIND_COMBO && notif == CBN_SELCHANGE) {
+            int sel = (int)SendDlgItemMessageW(hWnd, IDC_BIND_COMBO, CB_GETCURSEL, 0, 0);
+            if (sel == 0) {
+                s_bindMode = 0;
+            } else if (sel == 1) {
+                s_bindMode = 1;
+            } else {
+                // конкретный интерфейс
+                int ifIdx = sel - 2;
+                if (ifIdx >= 0 && ifIdx < (int)s_interfaces.size()) {
+                    s_bindMode = 2;
+                    s_bindIp   = s_interfaces[ifIdx].ip;
+                }
             }
-            int bind = (int)SendDlgItemMessageW(hDlg, IDC_BIND_COMBO, CB_GETCURSEL, 0, 0);
-            if (bind < 0 || bind > 2) bind = 2;
-
-            bool needRestart = (port != g_port || bind != g_bindMode);
-            g_port = port;
-            g_bindMode = bind;
-            SaveSettings();
-
-            if (needRestart) {
-                RestartHttpServer();
-            }
-            EndDialog(hDlg, IDOK);
-            return TRUE;
+            UpdateFrameControls();
         }
-        case IDC_BTN_CANCEL:
-        case IDCANCEL:
-            EndDialog(hDlg, IDCANCEL);
-            return TRUE;
+        if (id == IDC_ALLOW_CHECK && notif == BN_CLICKED) {
+            s_allowEnabled = (SendDlgItemMessageW(hWnd, IDC_ALLOW_CHECK, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            UpdateFrameControls();
         }
         break;
-    case WM_CLOSE:
-        EndDialog(hDlg, IDCANCEL);
-        return TRUE;
     }
-    return FALSE;
+    }
+    return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-HWND CreateSettingsDialog(HWND parent) {
-    // Создаём диалог в памяти (DLGTEMPLATE) — не нужен .rc файл
-    // Размер 320x180 dialog units
-    const int DLG_W = 280, DLG_H = 130;
-
-    // Выделяем буфер для template
-    WORD dlgBuf[2048] = {};
-    WORD* p = dlgBuf;
-
-    // DLGTEMPLATE
-    DLGTEMPLATE* dlg = (DLGTEMPLATE*)p;
-    dlg->style = DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU;
-    dlg->cdit  = 7;  // количество контролов
-    dlg->x = 0; dlg->y = 0; dlg->cx = DLG_W; dlg->cy = DLG_H;
-    p = (WORD*)(dlg + 1);
-    *p++ = 0; // menu
-    *p++ = 0; // class
-    // title "AIMP HTTP Control — Settings"
-    const wchar_t* title = L"AIMP HTTP Control \x2014 Settings";
-    int titleLen = (int)wcslen(title) + 1;
-    memcpy(p, title, titleLen * 2); p += titleLen;
-
-    // Helper lambda: add DLGITEMTEMPLATE
-    auto addItem = [&](DWORD style, int x, int y, int cx, int cy, WORD id, const wchar_t* cls, const wchar_t* text) {
-        // Align to DWORD
-        if ((ULONG_PTR)p & 2) p++;
-        DLGITEMTEMPLATE* item = (DLGITEMTEMPLATE*)p;
-        item->style = style | WS_CHILD | WS_VISIBLE;
-        item->x = (short)x; item->y = (short)y; item->cx = (short)cx; item->cy = (short)cy;
-        item->id = id;
-        p = (WORD*)(item + 1);
-        // class
-        int clsLen = (int)wcslen(cls) + 1;
-        memcpy(p, cls, clsLen * 2); p += clsLen;
-        // text
-        int txtLen = (int)wcslen(text) + 1;
-        memcpy(p, text, txtLen * 2); p += txtLen;
-        *p++ = 0; // extra
-    };
-
-    // Label "Port:"
-    addItem(SS_LEFT, 14, 16, 30, 10, (WORD)-1, L"STATIC", L"Port:");
-    // Edit (port)
-    addItem(ES_NUMBER | WS_BORDER | WS_TABSTOP, 50, 14, 50, 14, IDC_PORT_EDIT, L"EDIT", L"19122");
-    // Label "Bind:"
-    addItem(SS_LEFT, 14, 38, 30, 10, (WORD)-1, L"STATIC", L"Bind:");
-    // ComboBox (bind mode)
-    addItem(CBS_DROPDOWNLIST | WS_TABSTOP, 50, 36, 160, 80, IDC_BIND_COMBO, L"COMBOBOX", L"");
-    // Status label
-    addItem(SS_LEFT, 14, 62, 250, 10, IDC_STATUS_LABEL, L"STATIC", L"");
-    // OK button
-    addItem(BS_DEFPUSHBUTTON | WS_TABSTOP, 100, 90, 60, 18, IDC_BTN_OK, L"BUTTON", L"Save");
-    // Cancel button
-    addItem(WS_TABSTOP, 170, 90, 60, 18, IDC_BTN_CANCEL, L"BUTTON", L"Cancel");
-
-    return (HWND)(INT_PTR)DialogBoxIndirectW(g_hInstance, (DLGTEMPLATE*)dlgBuf, parent, SettingsDlgProc);
+// Регистрируем класс окна фрейма один раз
+static bool RegisterFrameClass() {
+    WNDCLASSEXW wc = {};
+    if (GetClassInfoExW(g_hInstance, L"AIMPHttpCtrlFrame", &wc)) return true;
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = FrameWndProc;
+    wc.hInstance     = g_hInstance;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = L"AIMPHttpCtrlFrame";
+    return RegisterClassExW(&wc) != 0;
 }
 
-// ==========================================
-// IAIMPExternalSettingsDialog — кнопка Settings в менеджере плагинов
-// ==========================================
-class PluginSettingsDialog : public IAIMPExternalSettingsDialog {
+// Вспомогательная: добавить static-контрол (label)
+static HWND AddLabel(HWND parent, int x, int y, int w, int h, WORD id, const wchar_t* text) {
+    return CreateWindowExW(0, L"STATIC", text,
+        WS_CHILD | WS_VISIBLE | SS_LEFT,
+        x, y, w, h, parent, (HMENU)(UINT_PTR)id, g_hInstance, nullptr);
+}
+
+// Вспомогательная: добавить edit-контрол
+static HWND AddEdit(HWND parent, int x, int y, int w, int h, WORD id, const wchar_t* text, bool numOnly = false) {
+    DWORD style = WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL;
+    if (numOnly) style |= ES_NUMBER;
+    HWND hw = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", text,
+        style, x, y, w, h, parent, (HMENU)(UINT_PTR)id, g_hInstance, nullptr);
+    return hw;
+}
+
+class HttpControlOptionsFrame : public IAIMPOptionsDialogFrame {
     LONG ref_ = 1;
+    IAIMPServiceOptionsDialog* svcOpts_ = nullptr;  // для FrameModified
 public:
+    explicit HttpControlOptionsFrame(IAIMPServiceOptionsDialog* svc) : svcOpts_(svc) {
+        if (svcOpts_) svcOpts_->AddRef();
+    }
+    virtual ~HttpControlOptionsFrame() {
+        if (svcOpts_) svcOpts_->Release();
+    }
+
+    // IUnknown
     HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == IID_IAIMPExternalSettingsDialog) {
-            *ppv = static_cast<IAIMPExternalSettingsDialog*>(this);
-            AddRef();
-            return S_OK;
+        if (riid == IID_IUnknown || riid == IID_IAIMPOptionsDialogFrame) {
+            *ppv = static_cast<IAIMPOptionsDialogFrame*>(this);
+            AddRef(); return S_OK;
         }
         return E_NOINTERFACE;
     }
@@ -1541,8 +1674,204 @@ public:
         return r;
     }
 
-    void WINAPI Show(HWND ParentWindow) override {
-        CreateSettingsDialog(ParentWindow);
+    // IAIMPOptionsDialogFrame
+    HRESULT WINAPI GetName(IAIMPString** s) override {
+        if (!s) return E_POINTER;
+        IAIMPString* str = nullptr;
+        if (g_core && g_core->CreateObject(IID_IAIMPString, (void**)&str) == S_OK && str) {
+            str->SetData(const_cast<wchar_t*>(L"HTTP Remote Control"), 19);
+            *s = str;
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    HWND WINAPI CreateFrame(HWND parentWnd) override {
+        RegisterFrameClass();
+
+        // Создаём дочернее окно фрейма
+        RECT rc; GetClientRect(parentWnd, &rc);
+        int W = rc.right - rc.left;
+
+        HWND hw = CreateWindowExW(0, L"AIMPHttpCtrlFrame", L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            0, 0, W, rc.bottom - rc.top,
+            parentWnd, nullptr, g_hInstance, nullptr);
+        s_frameHwnd = hw;
+        if (!hw) return nullptr;
+
+        // Загружаем текущие значения в локальные переменные фрейма
+        s_port         = g_port;
+        s_bindMode     = g_bindMode;
+        s_bindIp       = g_bindIp;
+        s_allowEnabled = g_allowListEnabled;
+        s_allowList    = g_allowList;
+
+        // Перечисляем сетевые интерфейсы
+        s_interfaces = EnumNetworkInterfaces();
+
+        HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+        // --- Секция: Server ---
+        // "Port:" label
+        HWND hPortLabel = AddLabel(hw, 12, 14, 60, 16, (WORD)-1, L"Port:");
+        SendMessageW(hPortLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // Port edit
+        wchar_t portBuf[16]; wsprintfW(portBuf, L"%d", s_port);
+        HWND hPortEdit = AddEdit(hw, 76, 12, 70, 20, IDC_PORT_EDIT, portBuf, true);
+        SendMessageW(hPortEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hPortEdit, EM_SETLIMITTEXT, 5, 0);
+
+        // "Listen interface:" label
+        HWND hBindLabel = AddLabel(hw, 12, 44, 120, 16, (WORD)-1, L"Listen interface:");
+        SendMessageW(hBindLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // Bind combo: первые два — фиксированные, далее — реальные интерфейсы
+        HWND hCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            136, 42, 260, 200, hw, (HMENU)(UINT_PTR)IDC_BIND_COMBO, g_hInstance, nullptr);
+        SendMessageW(hCombo, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"Localhost (127.0.0.1)");  // idx 0
+        SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)L"All interfaces (0.0.0.0)"); // idx 1
+        for (const auto& iface : s_interfaces)
+            SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)iface.displayName.c_str());
+
+        // Выбираем нужный элемент
+        if (s_bindMode == 0) {
+            SendMessageW(hCombo, CB_SETCURSEL, 0, 0);
+        } else if (s_bindMode == 2 && !s_bindIp.empty()) {
+            int idx = FindInterfaceComboIndex(s_bindIp);
+            SendMessageW(hCombo, CB_SETCURSEL, idx >= 0 ? idx : 1, 0);
+        } else {
+            SendMessageW(hCombo, CB_SETCURSEL, 1, 0);  // All interfaces
+        }
+
+        // --- Секция: Access policy ---
+        HWND hSep = CreateWindowExW(0, L"STATIC", L"",
+            WS_CHILD | WS_VISIBLE | SS_ETCHEDHORZ,
+            12, 76, W - 24, 2, hw, nullptr, g_hInstance, nullptr);
+        (void)hSep;
+
+        // Checkbox "Allow access only from:"
+        HWND hCheck = CreateWindowExW(0, L"BUTTON",
+            L"Allow access only from:",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
+            12, 88, 280, 20, hw, (HMENU)(UINT_PTR)IDC_ALLOW_CHECK, g_hInstance, nullptr);
+        SendMessageW(hCheck, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hCheck, BM_SETCHECK, s_allowEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        // "IP/CIDR list:" label
+        HWND hAlLabel = AddLabel(hw, 12, 120, 120, 16, IDC_ALLOW_LABEL, L"IP / CIDR list:");
+        SendMessageW(hAlLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        // AllowList edit
+        HWND hAlEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT",
+            Utf8ToWStr(s_allowList).c_str(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL,
+            136, 118, W - 148, 20, hw, (HMENU)(UINT_PTR)IDC_ALLOW_EDIT, g_hInstance, nullptr);
+        SendMessageW(hAlEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
+        SendMessageW(hAlEdit, EM_SETCUEBANNER, FALSE,
+            (LPARAM)L"192.168.1.0/24, 10.0.0.5, 172.16.0.0/12");
+        SendMessageW(hAlEdit, EM_SETLIMITTEXT, 1023, 0);
+
+        // Status label
+        wchar_t statusBuf[128];
+        const wchar_t* bindStr = (g_bindMode == 0) ? L"127.0.0.1"
+            : (g_bindMode == 2 && !g_bindIp.empty()) ? g_bindIp.c_str() : L"0.0.0.0";
+        wsprintfW(statusBuf, L"Server: %s:%d", bindStr, g_port);
+        HWND hStatus = AddLabel(hw, 12, 148, W - 24, 16, IDC_STATUS_LABEL, statusBuf);
+        SendMessageW(hStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+        UpdateFrameControls();
+        return hw;
+    }
+
+    void WINAPI DestroyFrame() override {
+        if (s_frameHwnd) {
+            DestroyWindow(s_frameHwnd);
+            s_frameHwnd = nullptr;
+        }
+    }
+
+    void WINAPI Notification(int id) override {
+        switch (id) {
+        case AIMP_SERVICE_OPTIONSDIALOG_NOTIFICATION_LOAD:
+            if (s_frameHwnd) {
+                s_port         = g_port;
+                s_bindMode     = g_bindMode;
+                s_bindIp       = g_bindIp;
+                s_allowEnabled = g_allowListEnabled;
+                s_allowList    = g_allowList;
+
+                wchar_t buf[16]; wsprintfW(buf, L"%d", s_port);
+                SetDlgItemTextW(s_frameHwnd, IDC_PORT_EDIT, buf);
+
+                // Выбираем нужный элемент комбобокса
+                if (s_bindMode == 0) {
+                    SendDlgItemMessageW(s_frameHwnd, IDC_BIND_COMBO, CB_SETCURSEL, 0, 0);
+                } else if (s_bindMode == 2 && !s_bindIp.empty()) {
+                    int idx = FindInterfaceComboIndex(s_bindIp);
+                    SendDlgItemMessageW(s_frameHwnd, IDC_BIND_COMBO, CB_SETCURSEL,
+                        idx >= 0 ? idx : 1, 0);
+                } else {
+                    SendDlgItemMessageW(s_frameHwnd, IDC_BIND_COMBO, CB_SETCURSEL, 1, 0);
+                }
+
+                SendDlgItemMessageW(s_frameHwnd, IDC_ALLOW_CHECK, BM_SETCHECK,
+                    s_allowEnabled ? BST_CHECKED : BST_UNCHECKED, 0);
+                SetDlgItemTextW(s_frameHwnd, IDC_ALLOW_EDIT,
+                    Utf8ToWStr(s_allowList).c_str());
+                UpdateFrameControls();
+            }
+            break;
+
+        case AIMP_SERVICE_OPTIONSDIALOG_NOTIFICATION_SAVE:
+            if (s_frameHwnd) {
+                BOOL ok = FALSE;
+                int port = GetDlgItemInt(s_frameHwnd, IDC_PORT_EDIT, &ok, FALSE);
+                if (!ok || port < 1 || port > 65535) port = g_port;
+
+                // s_bindMode и s_bindIp уже обновлены в FrameWndProc при CBN_SELCHANGE
+                bool allowEnabled = (SendDlgItemMessageW(s_frameHwnd, IDC_ALLOW_CHECK,
+                    BM_GETCHECK, 0, 0) == BST_CHECKED);
+                wchar_t alBuf[1024] = {};
+                GetDlgItemTextW(s_frameHwnd, IDC_ALLOW_EDIT, alBuf, 1024);
+                std::string allowList = WStrToUtf8(std::wstring(alBuf));
+
+                bool needRestart = (port != g_port || s_bindMode != g_bindMode || s_bindIp != g_bindIp);
+
+                g_port             = port;
+                g_bindMode         = s_bindMode;
+                g_bindIp           = s_bindIp;
+                g_allowListEnabled = allowEnabled;
+                g_allowList        = allowList;
+
+                SaveSettings();
+                if (needRestart) RestartHttpServer();
+
+                // Обновляем строку статуса
+                wchar_t statusBuf[128];
+                const wchar_t* bstr = (g_bindMode == 0) ? L"127.0.0.1"
+                    : (g_bindMode == 2 && !g_bindIp.empty()) ? g_bindIp.c_str() : L"0.0.0.0";
+                wsprintfW(statusBuf, L"Server: %s:%d", bstr, g_port);
+                SetDlgItemTextW(s_frameHwnd, IDC_STATUS_LABEL, statusBuf);
+            }
+            break;
+
+        case AIMP_SERVICE_OPTIONSDIALOG_NOTIFICATION_RESET:
+            if (s_frameHwnd) {
+                SetDlgItemTextW(s_frameHwnd, IDC_PORT_EDIT, L"19122");
+                SendDlgItemMessageW(s_frameHwnd, IDC_BIND_COMBO, CB_SETCURSEL, 1, 0);  // All interfaces
+                SendDlgItemMessageW(s_frameHwnd, IDC_ALLOW_CHECK, BM_SETCHECK, BST_UNCHECKED, 0);
+                SetDlgItemTextW(s_frameHwnd, IDC_ALLOW_EDIT, L"");
+                s_bindMode     = 1;
+                s_bindIp       = L"";
+                s_allowEnabled = false;
+                UpdateFrameControls();
+            }
+            break;
+        }
     }
 };
 
@@ -1564,28 +1893,25 @@ void RestartHttpServer() {
 }
 
 // ==========================================
-// Плагин AIMP
+// Плагин AIMP — реализует IAIMPPlugin + IAIMPOptionsDialogFrame на одном объекте
 // ==========================================
-class HttpControlPlugin : public IAIMPPlugin {
+class HttpControlPlugin : public IAIMPPlugin, public IAIMPOptionsDialogFrame {
     LONG ref_ = 1;
-    PluginSettingsDialog* settingsDlg_ = nullptr;
 public:
-    virtual ~HttpControlPlugin() {
-        if (settingsDlg_) settingsDlg_->Release();
-    }
     HRESULT WINAPI QueryInterface(REFIID riid, void** ppv) override {
         if (!ppv) return E_POINTER;
-        if (riid == IID_IAIMPExternalSettingsDialog) {
-            if (!settingsDlg_) settingsDlg_ = new PluginSettingsDialog();
-            *ppv = static_cast<IAIMPExternalSettingsDialog*>(settingsDlg_);
-            settingsDlg_->AddRef();
-            return S_OK;
+        if (riid == IID_IUnknown) {
+            *ppv = static_cast<IAIMPPlugin*>(this); AddRef(); return S_OK;
         }
-        *ppv = static_cast<IAIMPPlugin*>(this); AddRef(); return S_OK;
+        if (riid == IID_IAIMPOptionsDialogFrame) {
+            *ppv = static_cast<IAIMPOptionsDialogFrame*>(this); AddRef(); return S_OK;
+        }
+        return E_NOINTERFACE;
     }
     ULONG WINAPI AddRef()  override { return InterlockedIncrement(&ref_); }
     ULONG WINAPI Release() override { LONG r = InterlockedDecrement(&ref_); if (r==0) delete this; return r; }
 
+    // IAIMPPlugin
     TChar* WINAPI InfoGet(int Index) override {
         static wchar_t n[] = L"AIMP HTTP Remote Control";
         static wchar_t a[] = L"SLV Tech";
@@ -1601,10 +1927,19 @@ public:
     void WINAPI SystemNotification(int, IUnknown*) override {}
 
     HRESULT WINAPI Initialize(IAIMPCore* core) override {
+        IAIMPServicePlayer* player = nullptr;
+        if (core->QueryInterface(IID_IAIMPServicePlayer, (void**)&player) != S_OK || !player)
+            return E_FAIL;
+        player->Release();
+
         g_core = core;
-        // Загружаем настройки из INI
         LoadSettings();
-        // Запускаем синхронизацию фокуса с UI AIMP
+
+        // Регистрируем себя как страницу настроек.
+        // Первый аргумент — IID_IAIMPServiceOptionsDialog (не IID_IAIMPOptionsDialogFrame).
+        core->RegisterExtension(IID_IAIMPServiceOptionsDialog,
+            static_cast<IAIMPOptionsDialogFrame*>(this));
+
         InitFocusSync();
         g_serverThread = std::thread(RunHttpServer);
         g_serverThread.detach();
@@ -1617,11 +1952,37 @@ public:
             g_serverSocket = INVALID_SOCKET;
         }
         Sleep(300);
-        // Останавливаем синхронизацию фокуса
         FinalizeFocusSync();
         g_core = nullptr;
         return S_OK;
     }
+
+    // IAIMPOptionsDialogFrame
+    HRESULT WINAPI GetName(IAIMPString** s) override {
+        if (!s) return E_POINTER;
+        IAIMPString* str = nullptr;
+        if (g_core && g_core->CreateObject(IID_IAIMPString, (void**)&str) == S_OK && str) {
+            str->SetData(const_cast<wchar_t*>(L"HTTP Remote Control"), 19);
+            *s = str;
+            return S_OK;
+        }
+        return E_FAIL;
+    }
+
+    HWND WINAPI CreateFrame(HWND parentWnd) override {
+        return frame_.CreateFrame(parentWnd);
+    }
+
+    void WINAPI DestroyFrame() override {
+        frame_.DestroyFrame();
+    }
+
+    void WINAPI Notification(int id) override {
+        frame_.Notification(id);
+    }
+
+private:
+    HttpControlOptionsFrame frame_{nullptr};
 };
 
 extern "C" __declspec(dllexport) HRESULT WINAPI AIMPPluginGetHeader(IAIMPPlugin** header) {
