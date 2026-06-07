@@ -1,4 +1,4 @@
-# AIMP HTTP Remote Control
+# AIMP HTTP Remote Control Server
 
 [Русский](#русский) | [English](#english)
 
